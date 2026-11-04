@@ -2,7 +2,7 @@ from flask import Flask, jsonify
 from sqlalchemy import text
 
 from config import Config
-from app.extensions import db, migrate
+from app.extensions import db, migrate, cors
 
 
 def create_app(config_overrides=None):
@@ -23,6 +23,10 @@ def create_app(config_overrides=None):
     # Hook up the database extensions to this specific app instance.
     db.init_app(app)
     migrate.init_app(app, db)
+
+    # Allow the deployed frontend to call this API, including the admin
+    # session cookie (credentials) for the login-protected routes.
+    cors.init_app(app, origins=app.config["FRONTEND_ORIGINS"], supports_credentials=True)
 
     # Imported here (not at the top of the file) so the models are registered
     # with SQLAlchemy only once create_app() actually runs.
