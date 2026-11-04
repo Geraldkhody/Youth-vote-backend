@@ -1,5 +1,6 @@
 import os
 from dotenv import load_dotenv
+from urllib.parse import quote_plus
 
 # Load variables from the .env file into the environment so os.environ.get() can see them.
 load_dotenv()
@@ -41,6 +42,6 @@ class Config:
     # on both MariaDB (XAMPP, dev) and MySQL (production), so we never use
     # anything database-specific here.
     SQLALCHEMY_DATABASE_URI = (
-        f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+        f"mysql+pymysql://{DB_USER}:{quote_plus(DB_PASSWORD)}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
         f"?charset=utf8mb4"
     )
