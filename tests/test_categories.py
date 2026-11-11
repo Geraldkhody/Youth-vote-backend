@@ -33,6 +33,30 @@ def test_reject_empty_name(logged_in_client):
     assert "name" in response.get_json()["error"]
 
 
+def test_create_category_with_multi_letter_code(logged_in_client):
+    response = logged_in_client.post("/api/categories", json={
+        "name": "Best Youth Group",
+        "code_letter": "yth",  # lowercase on purpose, should be stored uppercase
+    })
+
+    assert response.status_code == 201
+    assert response.get_json()["code_letter"] == "YTH"
+
+
+def test_reject_code_letter_longer_than_three(logged_in_client):
+    response = logged_in_client.post("/api/categories", json={"name": "Too Long", "code_letter": "WXYZ"})
+
+    assert response.status_code == 400
+    assert "code_letter" in response.get_json()["error"]
+
+
+def test_reject_empty_code_letter(logged_in_client):
+    response = logged_in_client.post("/api/categories", json={"name": "No Code", "code_letter": ""})
+
+    assert response.status_code == 400
+    assert "code_letter" in response.get_json()["error"]
+
+
 def test_list_only_active_categories(logged_in_client):
     logged_in_client.post("/api/categories", json={"name": "Active One", "code_letter": "D"})
     logged_in_client.post("/api/categories", json={"name": "Active Two", "code_letter": "E"})

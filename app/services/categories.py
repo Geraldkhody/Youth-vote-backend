@@ -8,8 +8,8 @@ from app.services.audit import log_audit
 def create_category(name, code_letter, description=None):
     """Create a new category. Raises ValueError for bad input.
 
-    name must not be empty. code_letter must be a single A-Z letter that
-    isn't already used by another category.
+    name must not be empty. code_letter must be 1-3 A-Z letters that
+    aren't already used by another category.
     """
     name = (name or "").strip()
     code_letter = (code_letter or "").strip().upper()
@@ -17,8 +17,8 @@ def create_category(name, code_letter, description=None):
     if not name:
         raise ValueError("name is required")
 
-    if len(code_letter) != 1 or not code_letter.isalpha():
-        raise ValueError("code_letter must be a single letter A-Z")
+    if not (1 <= len(code_letter) <= 3) or not code_letter.isalpha():
+        raise ValueError("code_letter must be 1-3 letters A-Z")
 
     if Category.query.filter_by(code_letter=code_letter).first() is not None:
         raise ValueError(f"code_letter '{code_letter}' is already in use")
@@ -73,8 +73,8 @@ def update_category(category, name=None, description=None, is_active=None, code_
 
     if code_letter is not None:
         code_letter = code_letter.strip().upper()
-        if len(code_letter) != 1 or not code_letter.isalpha():
-            raise ValueError("code_letter must be a single letter A-Z")
+        if not (1 <= len(code_letter) <= 3) or not code_letter.isalpha():
+            raise ValueError("code_letter must be 1-3 letters A-Z")
         if code_letter != category.code_letter:
             if not can_change_code_letter(category):
                 raise ValueError("code_letter cannot be changed once the category has nominations or nominees")

@@ -19,7 +19,7 @@ class Nominee(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     category_id = db.Column(db.Integer, db.ForeignKey("categories.id"), nullable=False)
 
-    code = db.Column(db.String(3), nullable=False)  # e.g. "B47"
+    code = db.Column(db.String(5), nullable=False)  # e.g. "B47" or "YTH47"
     full_name = db.Column(db.String(255), nullable=False)
     phone = db.Column(db.String(12), nullable=False)
     is_active = db.Column(db.Boolean, nullable=False, default=True)

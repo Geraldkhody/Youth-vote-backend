@@ -17,8 +17,8 @@ class Category(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(255), nullable=False)
 
-    # A single letter (A-Z) used to label the category, e.g. in ballots.
-    code_letter = db.Column(db.String(1), nullable=False, unique=True)
+    # One to three letters (A-Z) used to label the category, e.g. in ballots.
+    code_letter = db.Column(db.String(3), nullable=False, unique=True)
 
     description = db.Column(db.Text, nullable=True)
     is_active = db.Column(db.Boolean, nullable=False, default=True)
