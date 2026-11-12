@@ -2,7 +2,7 @@ from flask import Blueprint, jsonify, request
 
 from app.auth_utils import admin_required
 from app.models.category import Category
-from app.services.categories import create_category, update_category
+from app.services.categories import create_category, delete_category, update_category
 
 # url_prefix means every route below is actually "/api/categories..."
 categories_bp = Blueprint("categories", __name__, url_prefix="/api/categories")
@@ -68,6 +68,18 @@ def update_category_route(category_id):
         return jsonify(error=str(error)), 400
 
     return jsonify(category.to_dict())
+
+
+@categories_bp.delete("/<int:category_id>")
+@admin_required
+def delete_category_route(category_id):
+    category = Category.query.get(category_id)
+    if category is None:
+        return jsonify(error="category not found"), 404
+
+    delete_category(category)
+
+    return "", 204
 
 
 @admin_categories_bp.get("")

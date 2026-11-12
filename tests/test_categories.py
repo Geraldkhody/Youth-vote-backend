@@ -123,15 +123,15 @@ def test_deactivate_hides_from_public_list_but_keeps_it(logged_in_client):
     assert get_response.get_json()["name"] == "Retiring"
 
 
-def test_code_letter_change_refused_with_nominations(logged_in_client, make_pending_nomination):
+def test_code_letter_change_allowed_with_nominations(logged_in_client, make_pending_nomination):
     create_response = logged_in_client.post("/api/categories", json={"name": "Has Nominations", "code_letter": "L"})
     category_id = create_response.get_json()["id"]
     make_pending_nomination(category_id=category_id)
 
     response = logged_in_client.patch(f"/api/categories/{category_id}", json={"code_letter": "M"})
 
-    assert response.status_code == 400
-    assert "nominations or nominees" in response.get_json()["error"]
+    assert response.status_code == 200
+    assert response.get_json()["code_letter"] == "M"
 
 
 def test_code_letter_change_allowed_without_nominations_or_nominees(logged_in_client):
@@ -142,3 +142,36 @@ def test_code_letter_change_allowed_without_nominations_or_nominees(logged_in_cl
 
     assert response.status_code == 200
     assert response.get_json()["code_letter"] == "O"
+
+
+def test_delete_category_requires_login(client):
+    response = client.delete("/api/categories/1")
+
+    assert response.status_code == 401
+
+
+def test_delete_category(logged_in_client):
+    create_response = logged_in_client.post("/api/categories", json={"name": "Deletable", "code_letter": "P"})
+    category_id = create_response.get_json()["id"]
+
+    response = logged_in_client.delete(f"/api/categories/{category_id}")
+
+    assert response.status_code == 204
+    assert logged_in_client.get(f"/api/categories/{category_id}").status_code == 404
+
+
+def test_delete_category_also_removes_its_nominations(logged_in_client, make_pending_nomination):
+    create_response = logged_in_client.post("/api/categories", json={"name": "With Nomination", "code_letter": "Q"})
+    category_id = create_response.get_json()["id"]
+    nomination_id = make_pending_nomination(category_id=category_id)
+
+    response = logged_in_client.delete(f"/api/categories/{category_id}")
+
+    assert response.status_code == 204
+    assert logged_in_client.get(f"/api/nominations/{nomination_id}").status_code == 404
+
+
+def test_delete_nonexistent_category(logged_in_client):
+    response = logged_in_client.delete("/api/categories/99999")
+
+    assert response.status_code == 404
