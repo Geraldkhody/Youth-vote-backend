@@ -10,6 +10,7 @@ def test_login_success(client, admin_user):
     data = response.get_json()
     assert data["name"] == "Admin User"
     assert data["email"] == "admin@example.com"
+    assert isinstance(data["token"], str) and data["token"]
 
 
 def test_wrong_password_refused(client, admin_user):
@@ -46,12 +47,14 @@ def test_me_returns_admin_when_logged_in(logged_in_client):
     assert response.get_json()["email"] == "admin@example.com"
 
 
-def test_logout_clears_session(logged_in_client):
-    logged_in_client.post("/api/auth/logout")
+def test_logout_confirms_without_erroring(logged_in_client):
+    """Logout is stateless -- there's no server-side session to invalidate,
+    the token stays valid until it expires or the frontend discards it.
+    This just checks the endpoint responds cleanly for a logged-in caller."""
+    response = logged_in_client.post("/api/auth/logout")
 
-    response = logged_in_client.get("/api/auth/me")
-
-    assert response.status_code == 401
+    assert response.status_code == 200
+    assert response.get_json()["message"] == "logged out"
 
 
 def test_password_is_stored_hashed(app, admin_user):

@@ -1,3 +1,5 @@
+import functools
+
 import pytest
 
 from app import create_app
@@ -93,8 +95,20 @@ def inactive_admin(app):
 
 @pytest.fixture
 def logged_in_client(client, admin_user):
-    """A test client that has already logged in as the admin_user fixture."""
-    client.post("/api/auth/login", json={"email": "admin@example.com", "password": "secret123"})
+    """A test client that has already logged in as the admin_user fixture.
+
+    Auth is a bearer token now, not a session cookie, so logging in doesn't
+    automatically carry over to later requests. We grab the token from the
+    login response and make it the default Authorization header for every
+    request this client makes from here on.
+    """
+    response = client.post("/api/auth/login", json={"email": "admin@example.com", "password": "secret123"})
+    token = response.get_json()["token"]
+
+    auth_header = {"Authorization": f"Bearer {token}"}
+    for method in ("get", "post", "patch", "put", "delete"):
+        setattr(client, method, functools.partial(getattr(client, method), headers=auth_header))
+
     return client
 
 

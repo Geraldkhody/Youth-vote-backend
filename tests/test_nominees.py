@@ -21,13 +21,13 @@ def test_public_list_hides_phone_numbers(client, make_active_nominee):
     assert set(nominee.keys()) == {"id", "code", "full_name", "category_id"}
 
 
-def test_detail_endpoint_requires_login(client, make_active_nominee):
+def test_detail_endpoint_requires_login(app, make_active_nominee):
     nominee = make_active_nominee()
-    # make_active_nominee logs the shared test client in to approve the
-    # nomination, so log back out before checking the logged-out behavior.
-    client.post("/api/auth/logout")
+    # make_active_nominee's client carries a valid Authorization header, so
+    # use a separate, never-logged-in client to check the logged-out behavior.
+    anonymous_client = app.test_client()
 
-    response = client.get(f"/api/nominees/{nominee['id']}")
+    response = anonymous_client.get(f"/api/nominees/{nominee['id']}")
 
     assert response.status_code == 401
 
