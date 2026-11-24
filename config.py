@@ -11,6 +11,12 @@ class Config:
 
     SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-key")
 
+    # The secret segment of the Hubtel USSD webhook URLs (e.g.
+    # /api/hubtel/<HUBTEL_PATH_TOKEN>/interaction). Must be at least 24
+    # characters, or the Hubtel routes are not registered at all -- see
+    # create_app() in app/__init__.py.
+    HUBTEL_PATH_TOKEN = os.environ.get("HUBTEL_PATH_TOKEN", "")
+
     # Deployed frontend origin(s) allowed to call this API, comma-separated.
     FRONTEND_ORIGINS = [
         origin.strip()

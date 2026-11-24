@@ -37,6 +37,7 @@ def create_app(config_overrides=None):
     from app.routes.auth import auth_bp
     from app.routes.nominees import nominees_bp
     from app.routes.audit import audit_bp
+    from app.routes.hubtel_admin import admin_hubtel_bp
 
     app.register_blueprint(categories_bp)
     app.register_blueprint(admin_categories_bp)
@@ -45,6 +46,21 @@ def create_app(config_overrides=None):
     app.register_blueprint(auth_bp)
     app.register_blueprint(nominees_bp)
     app.register_blueprint(audit_bp)
+    app.register_blueprint(admin_hubtel_bp)
+
+    # Hubtel USSD stub routes (app/routes/hubtel.py) only register when a
+    # real path token is configured. Without this, the URL would be
+    # predictable (just "/api/hubtel/<anything>/...") and that's the only
+    # thing standing between the public internet and these endpoints.
+    hubtel_token = app.config.get("HUBTEL_PATH_TOKEN", "")
+    if len(hubtel_token) >= 24:
+        from app.routes.hubtel import hubtel_bp
+        app.register_blueprint(hubtel_bp)
+    else:
+        app.logger.warning(
+            "HUBTEL_PATH_TOKEN is missing or shorter than 24 characters -- "
+            "Hubtel USSD routes were not registered."
+        )
 
     from app.cli import register_cli
     register_cli(app)
