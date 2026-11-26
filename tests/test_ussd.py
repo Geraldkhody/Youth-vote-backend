@@ -10,12 +10,15 @@ from datetime import datetime, timedelta
 
 import pytest
 
+import pathlib
+
 from app.extensions import db
 from app.models.category import Category
 from app.models.nominee import Nominee
 from app.models.transaction import Transaction
 from app.models.voting_settings import get_settings
 from app.services.ussd import handle_interaction
+from app.services.ussd_text import is_gsm7
 
 NOW = datetime(2026, 6, 1, 12, 0, 0)
 
@@ -311,7 +314,7 @@ def test_choosing_category_then_nominee_paging(app, category_with_many_nominees)
 
         response = handle_interaction(_req("s1", "6"), now=NOW)  # pick item 6 (the first on this page)
         assert response["Type"] == "response"
-        assert "How many votes" in response["Message"]
+        assert "Votes for" in response["Message"]
         assert "Nominee 5" in response["Message"]
 
 
@@ -468,8 +471,8 @@ def test_confirm_screen_shows_right_total(app, nominee_in_category):
         handle_interaction(_req("s1", "A47"), now=NOW)
         response = handle_interaction(_req("s1", "3"), now=NOW)
 
-        assert "3 vote(s)" in response["Message"]
-        assert "GH₵4.50" in response["Message"]
+        assert "3 votes" in response["Message"]
+        assert "GHS 4.50" in response["Message"]
         assert "1. Confirm" in response["Message"]
         assert "2. Cancel" in response["Message"]
 
@@ -490,7 +493,7 @@ def test_fee_change_between_confirm_screen_and_confirm_reasks(app, nominee_in_ca
 
         assert response["Type"] == "response"  # not AddToCart -- re-asked
         assert "fee has changed" in response["Message"].lower()
-        assert "GH₵6.00" in response["Message"]  # 2 * 3.00
+        assert "GHS 6.00" in response["Message"]  # 2 * 3.00
         assert Transaction.query.count() == 0
 
 
@@ -578,3 +581,103 @@ def test_release_type_creates_no_transaction(app, nominee_in_category):
 
         assert response["Type"] == "release"
         assert Transaction.query.count() == 0
+
+
+# ---------------------------------------------------------------------
+# GSM7 safety (see app/services/ussd_text.py)
+# ---------------------------------------------------------------------
+
+# A nominee name combining everything to_gsm7 has to handle: the
+# Ghanaian "open e" and "open o" letters, curly quotes, and an emoji.
+GSM7_HOSTILE_NAME = "Ɛb’Ɔd’é “J” \U0001f600 Mensah"
+
+
+@pytest.fixture
+def nominee_with_hostile_name(app, two_categories):
+    category_id, _ = two_categories
+    with app.app_context():
+        nominee = Nominee(
+            category_id=category_id, code="A48", full_name=GSM7_HOSTILE_NAME,
+            phone="233241234567", is_active=True,
+        )
+        db.session.add(nominee)
+        db.session.commit()
+        return nominee.id
+
+
+def test_every_screen_in_a_full_flow_is_gsm7_safe_and_within_160_chars(app, nominee_with_hostile_name):
+    with app.app_context():
+        _open_voting(fee_pesewas=100)
+        messages = []
+
+        messages.append(handle_interaction(_req("s1", type_="initiation"), now=NOW)["Message"])
+        messages.append(handle_interaction(_req("s1", "1"), now=NOW)["Message"])
+        messages.append(handle_interaction(_req("s1", "A48"), now=NOW)["Message"])  # quantity screen
+        messages.append(handle_interaction(_req("s1", "abc"), now=NOW)["Message"])  # invalid quantity
+        messages.append(handle_interaction(_req("s1", "3"), now=NOW)["Message"])  # confirm screen
+        messages.append(handle_interaction(_req("s1", "9"), now=NOW)["Message"])  # invalid confirm choice
+
+        settings = get_settings()
+        settings.vote_fee_pesewas = 300
+        db.session.commit()
+        messages.append(handle_interaction(_req("s1", "1"), now=NOW)["Message"])  # fee changed, re-asked
+
+        final = handle_interaction(_req("s1", "1"), now=NOW)  # AddToCart
+        messages.append(final["Message"])
+
+        for message in messages:
+            assert is_gsm7(message), message
+            assert len(message) <= 160
+            assert "₵" not in message
+
+
+def test_confirm_screen_fits_long_name_and_huge_quantity(app, two_categories):
+    category_id, _ = two_categories
+    with app.app_context():
+        nominee = Nominee(
+            category_id=category_id, code="A49", full_name="X" * 60,
+            phone="233241234567", is_active=True,
+        )
+        db.session.add(nominee)
+        db.session.commit()
+
+        _open_voting(fee_pesewas=100)
+        handle_interaction(_req("s1", type_="initiation"), now=NOW)
+        handle_interaction(_req("s1", "1"), now=NOW)
+        handle_interaction(_req("s1", "A49"), now=NOW)
+        response = handle_interaction(_req("s1", "1" * 9), now=NOW)  # a 9-digit quantity
+
+        assert "1. Confirm" in response["Message"]
+        assert "2. Cancel" in response["Message"]
+        assert "A49" in response["Message"]
+        assert len(response["Message"]) <= 160
+
+
+def test_addtocart_message_label_and_item_name_are_gsm7_safe(app, nominee_with_hostile_name):
+    with app.app_context():
+        _open_voting(fee_pesewas=100)
+        handle_interaction(_req("s1", type_="initiation"), now=NOW)
+        handle_interaction(_req("s1", "1"), now=NOW)
+        handle_interaction(_req("s1", "A48"), now=NOW)
+        handle_interaction(_req("s1", "2"), now=NOW)
+        response = handle_interaction(_req("s1", "1"), now=NOW)
+
+        assert response["Type"] == "AddToCart"
+        assert is_gsm7(response["Message"])
+        assert is_gsm7(response["Label"])
+        assert is_gsm7(response["Item"]["ItemName"])
+
+
+def test_no_cedi_sign_literal_in_ussd_source_files():
+    backend_dir = pathlib.Path(__file__).resolve().parent.parent
+    for relative_path in ("app/services/ussd.py", "app/services/ussd_text.py"):
+        source = (backend_dir / relative_path).read_text(encoding="utf-8")
+        assert "₵" not in source, f"cedi sign literal found in {relative_path}"
+
+
+def test_website_pricing_still_uses_cedi_sign():
+    # format_cedis (the website/admin formatter) is untouched by the
+    # USSD GSM7 fix -- it's allowed, and expected, to use the cedi sign.
+    from app.services.pricing import format_cedis
+
+    assert "₵" in format_cedis(100)
