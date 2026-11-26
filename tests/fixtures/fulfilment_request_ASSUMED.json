@@ -1,0 +1,5 @@
+{
+  "_note": "ASSUMED SHAPE -- not a real captured Hubtel fulfilment request. Replace with the real body once captured (see the admin Hubtel log, GET /api/admin/hubtel-log), and update parse_fulfilment_request in app/providers/hubtel_adapter.py to match.",
+  "SessionId": "sim-session-abc123",
+  "OrderId": "ORDER-0001"
+}

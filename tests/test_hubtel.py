@@ -20,6 +20,10 @@ def _app_with_hubtel(overrides=None):
 
 
 def test_interaction_with_right_token_returns_expected_shape():
+    """With no voting window configured, the menu (app/services/ussd.py)
+    ends the session with a "not scheduled" message -- the full menu walk
+    is covered in tests/test_ussd.py; this just proves the route wires it
+    up and returns Hubtel's required JSON shape."""
     app = _app_with_hubtel()
     with app.app_context():
         db.create_all()
@@ -43,7 +47,7 @@ def test_interaction_with_right_token_returns_expected_shape():
         body = response.get_json()
         assert body["SessionId"] == "abc123"
         assert body["Type"] == "release"
-        assert "voting opens soon" in body["Message"]
+        assert "not" in body["Message"].lower()  # "not scheduled yet"
         assert body["Label"]
         assert body["DataType"] == "display"
         assert body["FieldType"] == "text"
@@ -66,7 +70,11 @@ def test_interaction_with_wrong_token_returns_404():
         db.drop_all()
 
 
-def test_fulfillment_creates_no_votes_and_only_writes_to_log():
+def test_fulfillment_with_unknown_session_returns_200_and_changes_nothing_but_log():
+    """"abc123" doesn't match any real transaction's hubtel_session_id --
+    handle_fulfilment_request (app/services/hubtel_fulfilment.py) treats
+    that as "unknown_session" and changes nothing. The route still always
+    replies 200 regardless."""
     app = _app_with_hubtel()
     with app.app_context():
         db.create_all()
@@ -80,8 +88,30 @@ def test_fulfillment_creates_no_votes_and_only_writes_to_log():
         assert response.status_code == 200
         assert response.get_json()["status"] == "received"
 
-        # Only a HubtelLog row was written -- no vote/nomination table exists
-        # yet in this stub, so we just confirm the log itself got the row.
+        # Only the HubtelLog row was written -- nothing else changed.
+        logs = HubtelLog.query.filter_by(kind="fulfillment").all()
+        assert len(logs) == 1
+
+        db.drop_all()
+
+
+def test_fulfillment_with_unparseable_body_returns_200_and_changes_nothing_but_log():
+    """A body with no "SessionId" at all can't even be matched to a
+    transaction -- handle_fulfilment_request treats that as "unparsed"
+    and changes nothing, but the route still replies 200."""
+    app = _app_with_hubtel()
+    with app.app_context():
+        db.create_all()
+        client = app.test_client()
+
+        response = client.post(
+            f"/api/hubtel/{HUBTEL_TOKEN}/fulfillment",
+            json={"SomeUnexpectedField": "whatever"},
+        )
+
+        assert response.status_code == 200
+        assert response.get_json()["status"] == "received"
+
         logs = HubtelLog.query.filter_by(kind="fulfillment").all()
         assert len(logs) == 1
 

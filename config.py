@@ -17,6 +17,29 @@ class Config:
     # create_app() in app/__init__.py.
     HUBTEL_PATH_TOKEN = os.environ.get("HUBTEL_PATH_TOKEN", "")
 
+    # Hubtel's transaction status-check API (app/providers/hubtel.py).
+    # Never log or return HUBTEL_API_ID / HUBTEL_API_SECRET -- they're the
+    # credentials used to build the Basic auth header for that call.
+    HUBTEL_COLLECTION_ACCOUNT = os.environ.get("HUBTEL_COLLECTION_ACCOUNT", "")
+    HUBTEL_API_ID = os.environ.get("HUBTEL_API_ID", "")
+    HUBTEL_API_SECRET = os.environ.get("HUBTEL_API_SECRET", "")
+    HUBTEL_STATUS_BASE_URL = os.environ.get("HUBTEL_STATUS_BASE_URL", "https://api-txnstatus.hubtel.com")
+
+    # The final callback Hubtel asks us to send once a transaction is
+    # fulfilled (see app/services/hubtel_fulfilment.py).
+    HUBTEL_FINAL_CALLBACK_URL = os.environ.get("HUBTEL_FINAL_CALLBACK_URL", "https://gs-callback.hubtel.com:9055/callback")
+    # Off by default so a misconfigured dev/staging box can never spam
+    # Hubtel's real callback endpoint. Must be explicitly turned on.
+    HUBTEL_CALLBACK_ENABLED = os.environ.get("HUBTEL_CALLBACK_ENABLED", "false").lower() == "true"
+
+    # "fake" mode (local/dev only -- see create_app()'s startup check)
+    # makes the status check always report "paid" with the exact expected
+    # amount, and only logs the final callback instead of sending it, so
+    # the whole fulfilment flow can be exercised without a real Hubtel
+    # account.
+    HUBTEL_MODE = os.environ.get("HUBTEL_MODE", "live")
+    APP_ENV = os.environ.get("APP_ENV", "development")
+
     # Deployed frontend origin(s) allowed to call this API, comma-separated.
     FRONTEND_ORIGINS = [
         origin.strip()

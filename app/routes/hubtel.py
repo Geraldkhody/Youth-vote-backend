@@ -3,9 +3,9 @@ import hmac
 from flask import Blueprint, current_app, jsonify, request
 
 from app.services.hubtel import store_hubtel_log
+from app.services.hubtel_fulfilment import handle_fulfilment_request
+from app.services.ussd import handle_interaction
 
-# This is a STUB: it proves the hosting and request shapes work, with no
-# voting, payment or menu logic. See docs/HUBTEL_USSD_NOTES.md.
 hubtel_bp = Blueprint("hubtel", __name__, url_prefix="/api/hubtel")
 
 
@@ -24,19 +24,7 @@ def interaction(token):
         return "", 404
 
     body = request.get_json(silent=True) or {}
-    session_id = body.get("SessionId", "")
-    event_name = body.get("ServiceCode", "Youth Awards")
-
-    # Required response shape per docs/HUBTEL_USSD_NOTES.md: a short
-    # message that immediately ends the session (Type "release").
-    response_body = {
-        "SessionId": session_id,
-        "Type": "release",
-        "Message": f"{event_name}: voting opens soon",
-        "Label": "Youth Awards Voting",
-        "DataType": "display",
-        "FieldType": "text",
-    }
+    response_body = handle_interaction(body)
 
     store_hubtel_log(kind="interaction", raw_body=body, response_status=200)
     return jsonify(response_body), 200
@@ -49,7 +37,14 @@ def fulfillment(token):
 
     body = request.get_json(silent=True) or {}
 
-    # Stub only: record the request and acknowledge it. Does not create a
-    # vote, record a payment, or change anything else.
+    # handle_fulfilment_request never raises (see its docstring) -- if it
+    # ever did, we'd still want to log the request first.
     store_hubtel_log(kind="fulfillment", raw_body=body, response_status=200)
+    handle_fulfilment_request(body)
+
+    # Always 200, always this same tiny body, regardless of what
+    # happened internally (unparsed body, unknown session, wrong amount,
+    # etc.) -- never expose internal details in the reply. What Hubtel
+    # actually expects back here is still an open item (not captured in
+    # their docs yet).
     return jsonify(status="received"), 200

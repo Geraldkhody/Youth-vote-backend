@@ -1,0 +1,6 @@
+{
+  "_note": "ASSUMED SHAPE -- not a real captured Hubtel status-check response. Replace with the real body once captured, and update parse_status_response in app/providers/hubtel_adapter.py to match.",
+  "Status": "Paid",
+  "Amount": "5.00",
+  "Total": "5.10"
+}

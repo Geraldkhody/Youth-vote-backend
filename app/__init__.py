@@ -20,6 +20,12 @@ def create_app(config_overrides=None):
     if config_overrides:
         app.config.update(config_overrides)
 
+    # "fake" Hubtel mode (always reports payments as "paid", never really
+    # calls Hubtel) must never run in production -- that would mean every
+    # vote gets recorded as paid without anyone actually paying.
+    if app.config.get("HUBTEL_MODE") == "fake" and app.config.get("APP_ENV") == "production":
+        raise RuntimeError("Refusing to start: HUBTEL_MODE=fake with APP_ENV=production.")
+
     # Hook up the database extensions to this specific app instance.
     db.init_app(app)
     migrate.init_app(app, db)
@@ -38,6 +44,8 @@ def create_app(config_overrides=None):
     from app.routes.nominees import nominees_bp
     from app.routes.audit import audit_bp
     from app.routes.hubtel_admin import admin_hubtel_bp
+    from app.routes.voting_settings import voting_bp, admin_voting_bp
+    from app.routes.transactions_admin import admin_transactions_bp
 
     app.register_blueprint(categories_bp)
     app.register_blueprint(admin_categories_bp)
@@ -47,6 +55,9 @@ def create_app(config_overrides=None):
     app.register_blueprint(nominees_bp)
     app.register_blueprint(audit_bp)
     app.register_blueprint(admin_hubtel_bp)
+    app.register_blueprint(voting_bp)
+    app.register_blueprint(admin_voting_bp)
+    app.register_blueprint(admin_transactions_bp)
 
     # Hubtel USSD stub routes (app/routes/hubtel.py) only register when a
     # real path token is configured. Without this, the URL would be

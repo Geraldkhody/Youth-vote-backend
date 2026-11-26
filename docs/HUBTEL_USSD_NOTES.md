@@ -54,6 +54,49 @@ VERIFY: whether a `"release"` response really needs `Label`, `DataType` and
 `FieldType` filled in, or whether Hubtel ignores them once the session is
 ending. The stub sends them anyway since the docs mark all three mandatory.
 
+## AddToCart response
+
+We return this when the user confirms their vote purchase. It ends the
+USSD session and sends the user to Hubtel's checkout to pay:
+
+```json
+{
+  "SessionId": "<same as request>",
+  "Type": "AddToCart",
+  "Message": "The request has been submitted. Please wait for a payment prompt soon",
+  "Item": {
+    "ItemName": "<short text>",
+    "Qty": 1,
+    "Price": 1.50
+  },
+  "Label": "<same text as Message>",
+  "DataType": "display",
+  "FieldType": "text"
+}
+```
+
+`Price` is a decimal number of cedis (not pesewas), e.g. `1.50` for 150
+pesewas.
+
+## Transaction status check
+
+```
+GET https://api-txnstatus.hubtel.com/transactions/<COLLECTION_ACCOUNT>/status?clientReference=<reference>
+Authorization: Basic <base64 of API id:secret>
+```
+
+Our reading is that `clientReference` is the USSD `SessionId`. **VERIFY.**
+
+**STILL UNKNOWN — VERIFY:**
+- The status-check response format (status words and amount fields). Our
+  client (`app/providers/hubtel.py`) makes a conservative best guess at
+  parsing it and defaults to `"unknown"` for anything unrecognised --
+  `"unknown"` is never treated as `"paid"`.
+- The fulfilment request body (still just logged, not parsed).
+- The final callback body.
+- The maximum length of `ItemName`. We keep it under 40 characters as a
+  conservative guess.
+
 ## Service Fulfilment URL
 
 Hubtel POSTs here after the user has paid (the "Service Payment Callback").
@@ -71,8 +114,31 @@ We must `POST` to:
 https://gs-callback.hubtel.com:9055/callback
 ```
 
-- Body fields: **NOT CAPTURED — VERIFY**
-- Not called by this stub (there is nothing to fulfil yet).
+with exactly these fields:
+
+```json
+{"SessionId": "<session id>", "OrderId": "<order id>", "ServiceStatus": "success", "MetaData": null}
+```
+
+The example Hubtel gave us shows **no authorization header** -- our
+reading is that our static IP being whitelisted (see Security below) is
+the identity check here, not a header.
+
+Sent only for a transaction that reached `'success'` (a vote was
+recorded), only once, and only once we have its `OrderId` (from the
+fulfilment request -- see below). See `app/services/hubtel_fulfilment.py`
+for how "only once" is made safe against two overlapping attempts.
+
+**STILL UNKNOWN — VERIFY:**
+- What to send for a transaction that needed review instead (e.g. an
+  amount mismatch) -- we currently send nothing at all for those. Open
+  question for Hubtel.
+- Other `ServiceStatus` values besides `"success"` (what do we send when
+  we *can't* fulfil?).
+- The maximum time Hubtel waits for our fulfilment reply before it gives
+  up / retries.
+- Whether `OrderId` is present in the fulfilment request body itself, or
+  only obtainable some other way.
 
 ## Transaction Status Check
 
@@ -98,8 +164,13 @@ needed for this stub (it never returns `Type: "AddToCart"`).
 
 ## Open items (VERIFY before building real voting/payment logic)
 
-- [ ] Service Fulfilment URL request body fields
-- [ ] Final callback URL request body fields
-- [ ] Transaction Status Check: full URL and response fields
+- [ ] Service Fulfilment URL request body fields (what `app/providers/hubtel_adapter.py`'s
+      `parse_fulfilment_request` guesses at -- `SessionId` and `OrderId` only, nothing else trusted)
+- [ ] Transaction Status Check: the response format (status words, amount fields)
+- [ ] Whether `clientReference` in the status check is really the USSD `SessionId`
+- [ ] The maximum length of `ItemName` in the `AddToCart` response
 - [ ] Whether `release` responses need `Label`/`DataType`/`FieldType` populated
-- [ ] `AddToCart` `Item` structure (name, quantity, price fields)
+- [ ] What to send as the final callback for a `needs_review` transaction
+- [ ] Other `ServiceStatus` values, and what to send when we can't fulfil
+- [ ] The maximum time Hubtel waits for our fulfilment reply
+- [ ] Whether `OrderId` is present in the fulfilment request body
