@@ -502,7 +502,6 @@ def _confirm_message(quantity, nominee, amount_pesewas, prefix=""):
     return (
         f"{prefix}{quantity} vote(s) for {nominee.full_name} ({nominee.code})\n"
         f"Amount: {format_cedis(amount_pesewas)}\n"
-        # "A small Hubtel charge may be added.\n"
         "1. Confirm\n2. Cancel"
     )
 
