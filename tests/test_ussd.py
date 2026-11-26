@@ -94,6 +94,32 @@ def many_categories(app):
 
 
 @pytest.fixture
+def eleven_long_categories(app):
+    """11 active categories with long names (each with one nominee, so
+    picking a category always reaches the nominee list), to exercise
+    multi-page paging with continuous numbering."""
+    with app.app_context():
+        categories = [
+            Category(
+                name=f"Category Number {i:02d} For The Youth Awards Night",
+                code_letter=chr(ord("A") + i), is_active=True,
+            )
+            for i in range(11)
+        ]
+        db.session.add_all(categories)
+        db.session.commit()
+
+        nominees = [
+            Nominee(category_id=category.id, code=f"{category.code_letter}10",
+                     full_name=f"Nominee For {category.code_letter}", phone="233241234567", is_active=True)
+            for category in categories
+        ]
+        db.session.add_all(nominees)
+        db.session.commit()
+        return [category.id for category in categories]
+
+
+@pytest.fixture
 def category_with_many_nominees(app):
     """One category holding 7 active nominees, to exercise nominee paging."""
     with app.app_context():
@@ -109,6 +135,26 @@ def category_with_many_nominees(app):
         db.session.add_all(nominees)
         db.session.commit()
         return category.id
+
+
+@pytest.fixture
+def category_with_thirty_nominees(app):
+    """One category holding 30 active nominees with a long (60-char) name,
+    to exercise nominee paging and name truncation."""
+    with app.app_context():
+        category = Category(name="Massive Category", code_letter="M", is_active=True)
+        db.session.add(category)
+        db.session.commit()
+
+        long_name_tail = "x" * 54  # 6 + 54 = 60 chars total
+        nominees = [
+            Nominee(category_id=category.id, code=f"M{100 + i}", full_name=f"Nominee{i:02d}{long_name_tail}",
+                    phone="233241234567", is_active=True)
+            for i in range(30)
+        ]
+        db.session.add_all(nominees)
+        db.session.commit()
+        return category.id, [nominee.code for nominee in nominees]
 
 
 # ---------------------------------------------------------------------
@@ -224,23 +270,26 @@ def test_category_paging_first_page_has_five_and_more(app, many_categories):
         handle_interaction(_req("s1", type_="initiation"), now=NOW)
         response = handle_interaction(_req("s1", "2"), now=NOW)
 
-        assert "1. A - Category A" in response["Message"]
-        assert "5. E - Category E" in response["Message"]
+        assert "1. Category A" in response["Message"]
+        assert "5. Category E" in response["Message"]
         assert "0. More" in response["Message"]
+        assert "00. Back" not in response["Message"]  # first page
         assert "Category F" not in response["Message"]
+        assert "A - " not in response["Message"]  # no code letters in the category list
         assert len(response["Message"]) <= 160
 
 
-def test_category_paging_second_page_has_remainder_no_more(app, many_categories):
+def test_category_paging_second_page_has_remainder_no_more_has_back(app, many_categories):
     with app.app_context():
         _open_voting()
         handle_interaction(_req("s1", type_="initiation"), now=NOW)
         handle_interaction(_req("s1", "2"), now=NOW)
         response = handle_interaction(_req("s1", "0"), now=NOW)
 
-        assert "1. F - Category F" in response["Message"]
-        assert "2. G - Category G" in response["Message"]
+        assert "6. Category F" in response["Message"]
+        assert "7. Category G" in response["Message"]
         assert "0. More" not in response["Message"]
+        assert "00. Back" in response["Message"]
         assert len(response["Message"]) <= 160
 
 
@@ -252,16 +301,128 @@ def test_choosing_category_then_nominee_paging(app, category_with_many_nominees)
         response = handle_interaction(_req("s1", "1"), now=NOW)  # the only category
 
         assert "0. More" in response["Message"]
-        assert "Nominee 0" in response["Message"]
+        assert "1. Nominee 0 - P10" in response["Message"]
         assert len(response["Message"]) <= 160
 
         response = handle_interaction(_req("s1", "0"), now=NOW)  # next nominee page
-        assert "Nominee 5" in response["Message"]
+        assert "6. Nominee 5 - P15" in response["Message"]
         assert "0. More" not in response["Message"]
+        assert "00. Back" in response["Message"]
 
-        response = handle_interaction(_req("s1", "1"), now=NOW)  # pick first on this page
+        response = handle_interaction(_req("s1", "6"), now=NOW)  # pick item 6 (the first on this page)
         assert response["Type"] == "response"
         assert "How many votes" in response["Message"]
+        assert "Nominee 5" in response["Message"]
+
+
+def test_eleven_categories_all_shown_once_numbered_continuously_no_codes(app, eleven_long_categories):
+    with app.app_context():
+        _open_voting()
+        handle_interaction(_req("s1", type_="initiation"), now=NOW)
+        response = handle_interaction(_req("s1", "2"), now=NOW)
+
+        seen_numbers = []
+        for page in range(10):  # generous upper bound on page count
+            for line in response["Message"].splitlines():
+                if line[:1].isdigit() and ". " in line and not line.startswith("00."):
+                    number = int(line.split(".", 1)[0])
+                    if number != 0:  # "0. More" isn't an item row
+                        seen_numbers.append(number)
+            assert len(response["Message"]) <= 160
+            for letter in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"]:
+                assert f"{letter} - " not in response["Message"]
+            if "0. More" not in response["Message"]:
+                break
+            response = handle_interaction(_req("s1", "0"), now=NOW)
+
+        assert "0. More" not in response["Message"]
+        assert seen_numbers == list(range(1, 12))
+
+
+def test_choosing_number_on_second_page_selects_item_by_overall_position(app, eleven_long_categories):
+    with app.app_context():
+        _open_voting()
+        handle_interaction(_req("s1", type_="initiation"), now=NOW)
+        response = handle_interaction(_req("s1", "2"), now=NOW)  # page 1
+
+        # Walk pages (via "0. More") until item #7 is shown on the current
+        # page -- the exact page size varies with name length, so this
+        # finds whichever page that lands on rather than assuming one.
+        while "7. " not in response["Message"]:
+            assert "0. More" in response["Message"]
+            response = handle_interaction(_req("s1", "0"), now=NOW)
+
+        response = handle_interaction(_req("s1", "7"), now=NOW)
+
+        assert response["Type"] == "response"
+        assert "Choose a nominee" in response["Message"]
+        # The 7th category overall is category G (categories are ordered
+        # by code_letter, A..K for this fixture) -- its one nominee (G10)
+        # must be the one shown, proving #7 meant the 7th item overall,
+        # not the 2nd item on whatever page it was shown on.
+        assert "G10" in response["Message"]
+
+
+def test_number_not_on_current_page_reasks_with_error(app, eleven_long_categories):
+    with app.app_context():
+        _open_voting()
+        handle_interaction(_req("s1", type_="initiation"), now=NOW)
+        handle_interaction(_req("s1", "2"), now=NOW)  # page 1: items 1..N
+
+        response = handle_interaction(_req("s1", "20"), now=NOW)  # far out of range
+
+        assert response["Type"] == "response"
+        assert "not valid" in response["Message"].lower()
+        assert "1. " in response["Message"]
+
+
+def test_thirty_nominees_paging_numbers_continuously_and_truncates_name_not_code(app, category_with_thirty_nominees):
+    category_id, codes = category_with_thirty_nominees
+    with app.app_context():
+        _open_voting()
+        handle_interaction(_req("s1", type_="initiation"), now=NOW)
+        handle_interaction(_req("s1", "2"), now=NOW)
+        response = handle_interaction(_req("s1", "1"), now=NOW)  # only category -> nominee list
+
+        seen_codes = []
+        for _ in range(15):  # generous upper bound on page count
+            for line in response["Message"].splitlines():
+                if line[:1].isdigit() and " - " in line and not line.startswith("00."):
+                    code = line.rsplit(" - ", 1)[1]
+                    assert code in codes  # the code itself is never truncated
+                    seen_codes.append(code)
+            assert len(response["Message"]) <= 160
+            if "0. More" not in response["Message"]:
+                break
+            response = handle_interaction(_req("s1", "0"), now=NOW)
+
+        assert "0. More" not in response["Message"]
+        assert sorted(seen_codes) == sorted(codes)
+        assert len(seen_codes) == len(set(seen_codes))
+
+
+def test_back_returns_to_previous_page_with_varying_page_sizes(app, category_with_thirty_nominees):
+    category_id, codes = category_with_thirty_nominees
+    with app.app_context():
+        _open_voting()
+        handle_interaction(_req("s1", type_="initiation"), now=NOW)
+        handle_interaction(_req("s1", "2"), now=NOW)
+        page1 = handle_interaction(_req("s1", "1"), now=NOW)
+        page2 = handle_interaction(_req("s1", "0"), now=NOW)
+
+        assert page2["Message"] != page1["Message"]
+
+        back_to_page1 = handle_interaction(_req("s1", " 00 "), now=NOW)  # spaces around "00"
+        assert back_to_page1["Message"] == page1["Message"]
+        assert "00. Back" not in back_to_page1["Message"]  # first page again
+
+
+def test_cedi_symbol_never_appears_in_category_or_nominee_lists(app, eleven_long_categories, category_with_thirty_nominees):
+    with app.app_context():
+        _open_voting()
+        handle_interaction(_req("s1", type_="initiation"), now=NOW)
+        response = handle_interaction(_req("s1", "2"), now=NOW)
+        assert "₵" not in response["Message"]
 
 
 # ---------------------------------------------------------------------
