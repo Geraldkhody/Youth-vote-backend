@@ -2,6 +2,8 @@ import json
 import re
 from datetime import datetime, timezone
 
+from flask import current_app
+
 from app.extensions import db
 from app.models.hubtel_log import HubtelLog
 
@@ -47,7 +49,25 @@ def _cap_to_max_size(masked_body):
     }
 
 
-def store_hubtel_log(kind, raw_body, response_status):
+def get_client_ip(request):
+    """The client IP to trust for one request.
+
+    By default this is the real TCP peer (request.remote_addr) -- the one
+    thing a caller can't fake. Only when HUBTEL_TRUST_PROXY_HEADERS is
+    explicitly turned on (because we know we're behind a reverse proxy
+    that sets it) do we instead read X-Forwarded-For, taking its leftmost
+    address. See config.py's comment on HUBTEL_FULFILMENT_ALLOWED_IPS for
+    why getting this wrong is dangerous -- trusting that header when
+    there's no proxy in front of us would let anyone claim any IP.
+    """
+    if current_app.config.get("HUBTEL_TRUST_PROXY_HEADERS"):
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+    return request.remote_addr
+
+
+def store_hubtel_log(kind, raw_body, response_status, source_ip=None):
     """Save one Hubtel request/response pair to the test-period log.
 
     This log is for the test period only -- it must be reviewed and pruned
@@ -61,6 +81,7 @@ def store_hubtel_log(kind, raw_body, response_status):
         received_at=datetime.now(timezone.utc),
         body=stored_body,
         response_status=response_status,
+        source_ip=source_ip,
     )
     db.session.add(log)
     db.session.commit()

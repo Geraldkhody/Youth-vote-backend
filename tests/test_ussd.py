@@ -583,6 +583,48 @@ def test_release_type_creates_no_transaction(app, nominee_in_category):
         assert Transaction.query.count() == 0
 
 
+@pytest.mark.parametrize("type_", ["Timeout", "timeout", "Release", "TIMEOUT"])
+def test_timeout_and_release_types_end_session_no_transaction_case_insensitive(app, nominee_in_category, type_):
+    with app.app_context():
+        _open_voting()
+        handle_interaction(_req("s1", type_="initiation"), now=NOW)
+        handle_interaction(_req("s1", "1"), now=NOW)
+        handle_interaction(_req("s1", "A47"), now=NOW)
+        handle_interaction(_req("s1", "2"), now=NOW)
+        response = handle_interaction(_req("s1", "", type_=type_), now=NOW)
+
+        assert response["Type"] == "release"
+        assert Transaction.query.count() == 0
+
+
+def test_unknown_type_never_returns_500_ends_up_safe(app):
+    with app.app_context():
+        _open_voting()
+        # No crash for a Type we've never seen, and no session exists yet
+        # either -- falls back to showing the main menu rather than
+        # raising.
+        response = handle_interaction(_req("s-unknown-type", "", type_="SomeNewMobileAppEvent"), now=NOW)
+
+        assert response["SessionId"] == "s-unknown-type"
+        assert response["Label"]
+        assert response["DataType"]
+        assert response["FieldType"]
+        assert response["Message"]
+
+
+@pytest.mark.parametrize("platform", ["Webstore", "Hubtel-App", "USSD"])
+def test_every_platform_gets_mandatory_response_fields(app, platform):
+    with app.app_context():
+        _open_voting()
+        body = _req("s-platform", type_="initiation")
+        body["Platform"] = platform
+        response = handle_interaction(body, now=NOW)
+
+        for field in ("SessionId", "Type", "Message", "Label", "DataType", "FieldType"):
+            assert field in response
+            assert response[field]
+
+
 # ---------------------------------------------------------------------
 # GSM7 safety (see app/services/ussd_text.py)
 # ---------------------------------------------------------------------

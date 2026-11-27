@@ -40,6 +40,24 @@ class Config:
     HUBTEL_MODE = os.environ.get("HUBTEL_MODE", "live")
     APP_ENV = os.environ.get("APP_ENV", "development")
 
+    # Only trust the X-Forwarded-For header for the client IP (used for
+    # the Hubtel request log and the fulfilment allowlist below) when
+    # we're actually behind a reverse proxy that sets it -- otherwise a
+    # caller could put whatever they like in that header and dodge the
+    # allowlist. Off by default.
+    HUBTEL_TRUST_PROXY_HEADERS = os.environ.get("HUBTEL_TRUST_PROXY_HEADERS", "false").lower() == "true"
+
+    # Optional allowlist for the Service Fulfilment URL, comma-separated
+    # IPs. Empty (default) means no restriction. Hubtel's documented
+    # fulfilment IPs are 52.50.116.54, 18.202.122.131 and 52.31.15.68 --
+    # enable this only after confirming from the Hubtel log that real
+    # requests actually show those addresses, because behind a proxy the
+    # visible address may differ, and a wrong setting here would block
+    # real payments.
+    HUBTEL_FULFILMENT_ALLOWED_IPS = [
+        ip.strip() for ip in os.environ.get("HUBTEL_FULFILMENT_ALLOWED_IPS", "").split(",") if ip.strip()
+    ]
+
     # Deployed frontend origin(s) allowed to call this API, comma-separated.
     FRONTEND_ORIGINS = [
         origin.strip()

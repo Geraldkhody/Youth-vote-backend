@@ -2,10 +2,10 @@
 
 Source: pasted by the project owner from Hubtel's developer docs
 (`api-reference-prog-services` and the `Programmable Services` reference
-page). These notes are the source of truth for the stub endpoints in
-`app/routes/hubtel.py`. Anything Hubtel's docs didn't give us is listed
-under **Open items** below and must be verified before real voting logic
-is built on top of this stub.
+page), most recently updated 26 Nov 2026. These notes are the source of
+truth for the stub endpoints in `app/routes/hubtel.py`. Anything Hubtel's
+docs didn't give us is listed under **Open items** below and must be
+verified before real voting logic is built on top of this stub.
 
 ## Request Hubtel sends to our Service Interaction URL
 
@@ -13,15 +13,15 @@ is built on top of this stub.
 
 | Field | Meaning |
 |---|---|
-| `Type` | `"initiation"` (first message of a session), `"response"` (later message), `"release"` (user ended the session), `"AddToCart"` (user is being sent to checkout) |
-| `Message` | What the user typed. On `initiation` over USSD, this is the dialed string |
+| `Type` | **CONFIRMED (26 Nov 2026):** `"Initiation"` (first message of a session), `"Response"` (later message), or `"Timeout"` (the user cancelled/the session timed out). Compared case-insensitively in `app/services/ussd.py`. `"Release"` is handled the same as `"Timeout"` (both end the session, create no transaction) since some Hubtel docs use that name for the same event. An unknown `Type` must never cause a 500 -- it ends the session politely instead (see `handle_interaction`) |
+| `Message` | What the user typed. On `Initiation` over USSD, this is the dialed string |
 | `ServiceCode` | The dialed short code, or a service id |
 | `Operator` | For USSD: one of `"tigo"`, `"airtel"`, `"mtn"`, `"vodafone"` |
 | `ClientState` | Data we asked Hubtel to echo back from our previous reply. Arrives only on the *next* request, then is discarded |
 | `Mobile` | The user's phone number, e.g. `233200585542` |
 | `SessionId` | Unique id of the session |
 | `Sequence` | Integer — position of the message in the session |
-| `Platform` | `"USSD"`, `"HUBTEL APP"`, `"HUBTEL POS"` or `"WEB"` |
+| `Platform` | **CONFIRMED (26 Nov 2026):** `"USSD"`, `"Webstore"` or `"Hubtel-App"`. We never assume USSD -- every response always carries all the mandatory fields below regardless of platform, and messages stay plain GSM-safe text. `Type` and `Platform` are logged (no personal data) for every interaction |
 
 ## Response we must return from the Service Interaction URL
 
@@ -87,15 +87,33 @@ Authorization: Basic <base64 of API id:secret>
 
 Our reading is that `clientReference` is the USSD `SessionId`. **VERIFY.**
 
+**CONFIRMED (26 Nov 2026):** the status word is one of `"Paid"`,
+`"Unpaid"` or `"Refunded"`:
+- `"Paid"`: exactly as before -- confirm the amount matches, record the
+  vote, send the final callback.
+- `"Unpaid"`: not paid yet. Treated exactly like `"pending"` -- no vote,
+  no failure, stays pending, the sweep checks again later. Never marked
+  `"failed"` just for being `"Unpaid"`.
+- `"Refunded"`: if no vote exists yet, flagged `needs_review` with reason
+  `"refunded by Hubtel"` and no vote is created. If a vote already
+  exists, flagged `needs_review` with reason `"refunded after vote was
+  recorded"` and the vote is left exactly as it is -- reversing it is an
+  organisers' decision, not an automatic one. No final callback is sent
+  either way. See `process_hubtel_payment` in
+  `app/services/hubtel_fulfilment.py`.
+- Anything else: `"unknown"`, logged safely (no personal data), never
+  treated as `"paid"`.
+
 **STILL UNKNOWN — VERIFY:**
-- The status-check response format (status words and amount fields). Our
-  client (`app/providers/hubtel.py`) makes a conservative best guess at
-  parsing it and defaults to `"unknown"` for anything unrecognised --
+- The exact field names carrying the status word and amount. Our client
+  (`app/providers/hubtel_adapter.py`) makes a conservative best guess at
+  parsing them and defaults to `"unknown"` for anything unrecognised --
   `"unknown"` is never treated as `"paid"`.
-- The fulfilment request body (still just logged, not parsed).
+- The fulfilment request body (still just logged, not parsed, beyond
+  `SessionId`/`OrderId`).
 - The final callback body.
 - The maximum length of `ItemName`. We keep it under 40 characters as a
-  conservative guess.
+  conservative guess -- still unconfirmed.
 
 ## Service Fulfilment URL
 
@@ -129,16 +147,38 @@ recorded), only once, and only once we have its `OrderId` (from the
 fulfilment request -- see below). See `app/services/hubtel_fulfilment.py`
 for how "only once" is made safe against two overlapping attempts.
 
+**CONFIRMED (26 Nov 2026):** Hubtel requires this callback within **one
+hour** of receiving the fulfilment request (`fulfilment_received_at`).
+That deadline lives in code as the named constant
+`HUBTEL_CALLBACK_DEADLINE_MINUTES = 60`
+(`app/services/hubtel_fulfilment.py`). The retry schedule, all measured
+from `fulfilment_received_at`:
+- Status-check retries (`flask hubtel-sweep`) for a still-pending
+  transaction: every sweep run for the first 30 minutes, then every 5
+  minutes, until 24 hours (then flagged `needs_review`).
+- Final-callback retries for a `'success'` transaction: every sweep run
+  for the first 10 minutes, then every 5 minutes, until 55 minutes (a
+  5-minute safety margin before the real one-hour cutoff) -- after that,
+  `send_final_callback` stops and sets `needs_review` with reason
+  `"final callback not sent within one hour"` instead of retrying
+  forever.
+- `GET /api/admin/transactions` exposes `minutes_since_fulfilment` per
+  transaction and a `?callback_overdue=1` filter (`'success'`, no
+  `callback_sent_at`, more than 30 minutes since fulfilment) so this is
+  visible to an admin before it becomes a real problem.
+
 **STILL UNKNOWN — VERIFY:**
 - What to send for a transaction that needed review instead (e.g. an
-  amount mismatch) -- we currently send nothing at all for those. Open
-  question for Hubtel.
+  amount mismatch, or a refund) -- we currently send nothing at all for
+  those. Open question for Hubtel.
 - Other `ServiceStatus` values besides `"success"` (what do we send when
   we *can't* fulfil?).
 - The maximum time Hubtel waits for our fulfilment reply before it gives
   up / retries.
 - Whether `OrderId` is present in the fulfilment request body itself, or
   only obtainable some other way.
+- What actually happens on Hubtel's side to a payment if we never manage
+  to send the final callback within the hour.
 
 ## Transaction Status Check
 
@@ -161,16 +201,44 @@ needed for this stub (it never returns `Type: "AddToCart"`).
   check).
 - Testing: Hubtel's Simulator for the user flow, and a Hubtel POS device or
   a USSD code for the full purchase flow.
+- **Incoming side (Service Fulfilment URL):** every Hubtel request is
+  logged with its source IP (`HubtelLog.source_ip`, see
+  `GET /api/admin/hubtel-log`). An optional allowlist,
+  `HUBTEL_FULFILMENT_ALLOWED_IPS`, can restrict the Service Fulfilment
+  URL to Hubtel's documented fulfilment IPs -- `52.50.116.54`,
+  `18.202.122.131` and `52.31.15.68`. **Enable this only after confirming
+  from the log that real requests actually show those addresses** --
+  behind a proxy the visible address may differ, and a wrong setting
+  here would block real payments. (`HUBTEL_TRUST_PROXY_HEADERS` controls
+  whether `X-Forwarded-For` is trusted for this at all; off by default.)
+  The same note applies to `docs/DEPLOY.md` if/when one exists -- there
+  currently isn't a separate deploy-notes file in this repo.
 
-## Open items (VERIFY before building real voting/payment logic)
+## Open items (VERIFY before going live)
 
-- [ ] Service Fulfilment URL request body fields (what `app/providers/hubtel_adapter.py`'s
-      `parse_fulfilment_request` guesses at -- `SessionId` and `OrderId` only, nothing else trusted)
-- [ ] Transaction Status Check: the response format (status words, amount fields)
-- [ ] Whether `clientReference` in the status check is really the USSD `SessionId`
+- [ ] What happens, on Hubtel's side, to a payment if the final callback
+      is not sent within the one hour deadline
+- [ ] Other `ServiceStatus` values besides `"success"`, and what to send
+      when we can't fulfil a paid order
+- [ ] The maximum time Hubtel waits for our fulfilment reply before it
+      gives up / retries
+- [ ] Whether the test/simulator credentials we've been given talk to a
+      sandbox or to Hubtel's live system
 - [ ] The maximum length of `ItemName` in the `AddToCart` response
-- [ ] Whether `release` responses need `Label`/`DataType`/`FieldType` populated
-- [ ] What to send as the final callback for a `needs_review` transaction
-- [ ] Other `ServiceStatus` values, and what to send when we can't fulfil
-- [ ] The maximum time Hubtel waits for our fulfilment reply
-- [ ] Whether `OrderId` is present in the fulfilment request body
+- [ ] The charge rate Hubtel applies on top of small amounts (e.g. the
+      default GH₵1.00 vote fee) -- needed so the confirm screen's "Hubtel
+      may add a small charge" warning can eventually say how much
+- [ ] Whether `isFulfilled` becomes `true` on Hubtel's side only after we
+      send the final callback, or already once we reply to the
+      fulfilment request
+- [ ] For later web voting: Hubtel's rule on unsolicited payment prompts
+      -- whether it requires the phone number to belong to a Hubtel user
+      who can't edit it, or whether we must confirm an unregistered
+      number before charging it
+- [ ] The exact field names carrying the status-check's status word and
+      amount (`app/providers/hubtel_adapter.py` still guesses at these)
+- [ ] The fulfilment request body's fields beyond `SessionId`/`OrderId`
+- [ ] The final callback body beyond the four fields already confirmed
+- [ ] Whether `clientReference` in the status check is really the USSD `SessionId`
+- [ ] Whether `OrderId` is present in the fulfilment request body itself, or
+      only obtainable some other way

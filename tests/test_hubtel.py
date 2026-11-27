@@ -194,6 +194,116 @@ def test_hubtel_routes_do_not_register_when_token_too_short():
         db.drop_all()
 
 
+def test_source_ip_is_stored_on_every_request():
+    app = _app_with_hubtel()
+    with app.app_context():
+        db.create_all()
+        client = app.test_client()
+
+        client.post(f"/api/hubtel/{HUBTEL_TOKEN}/interaction", json={"Type": "initiation", "SessionId": "s1"})
+
+        log = HubtelLog.query.filter_by(kind="interaction").first()
+        assert log.source_ip is not None
+
+        db.drop_all()
+
+
+def test_fulfilment_allowlist_empty_accepts_every_ip():
+    app = _app_with_hubtel(overrides={"HUBTEL_FULFILMENT_ALLOWED_IPS": []})
+    with app.app_context():
+        db.create_all()
+        client = app.test_client()
+
+        response = client.post(
+            f"/api/hubtel/{HUBTEL_TOKEN}/fulfillment",
+            json={"SessionId": "abc123"},
+        )
+        assert response.status_code == 200
+        db.drop_all()
+
+
+def test_fulfilment_allowlist_blocks_an_unlisted_ip_and_logs_it():
+    app = _app_with_hubtel(overrides={"HUBTEL_FULFILMENT_ALLOWED_IPS": ["52.50.116.54"]})
+    with app.app_context():
+        db.create_all()
+        client = app.test_client()
+
+        # The Flask test client's remote_addr is "127.0.0.1", not an
+        # allowed IP.
+        response = client.post(
+            f"/api/hubtel/{HUBTEL_TOKEN}/fulfillment",
+            json={"SessionId": "abc123"},
+        )
+        assert response.status_code == 404
+
+        blocked = HubtelLog.query.filter_by(kind="blocked").all()
+        assert len(blocked) == 1
+        assert blocked[0].source_ip == "127.0.0.1"
+
+        db.drop_all()
+
+
+def test_fulfilment_allowlist_accepts_a_listed_ip():
+    app = _app_with_hubtel(overrides={"HUBTEL_FULFILMENT_ALLOWED_IPS": ["127.0.0.1"]})
+    with app.app_context():
+        db.create_all()
+        client = app.test_client()
+
+        response = client.post(
+            f"/api/hubtel/{HUBTEL_TOKEN}/fulfillment",
+            json={"SessionId": "abc123"},
+        )
+        assert response.status_code == 200
+
+        blocked = HubtelLog.query.filter_by(kind="blocked").all()
+        assert len(blocked) == 0
+
+        db.drop_all()
+
+
+def test_x_forwarded_for_ignored_unless_trust_proxy_headers_enabled():
+    app = _app_with_hubtel(overrides={
+        "HUBTEL_FULFILMENT_ALLOWED_IPS": ["9.9.9.9"],
+        "HUBTEL_TRUST_PROXY_HEADERS": False,
+    })
+    with app.app_context():
+        db.create_all()
+        client = app.test_client()
+
+        # Even though X-Forwarded-For claims the allowed IP, the header is
+        # not trusted -- the real test-client peer (127.0.0.1) is used,
+        # which isn't on the allowlist, so this is still blocked.
+        response = client.post(
+            f"/api/hubtel/{HUBTEL_TOKEN}/fulfillment",
+            json={"SessionId": "abc123"},
+            headers={"X-Forwarded-For": "9.9.9.9"},
+        )
+        assert response.status_code == 404
+        db.drop_all()
+
+
+def test_x_forwarded_for_used_when_trust_proxy_headers_enabled():
+    app = _app_with_hubtel(overrides={
+        "HUBTEL_FULFILMENT_ALLOWED_IPS": ["9.9.9.9"],
+        "HUBTEL_TRUST_PROXY_HEADERS": True,
+    })
+    with app.app_context():
+        db.create_all()
+        client = app.test_client()
+
+        response = client.post(
+            f"/api/hubtel/{HUBTEL_TOKEN}/fulfillment",
+            json={"SessionId": "abc123"},
+            headers={"X-Forwarded-For": "9.9.9.9, 10.0.0.1"},
+        )
+        assert response.status_code == 200
+
+        log = HubtelLog.query.filter_by(kind="fulfillment").first()
+        assert log.source_ip == "9.9.9.9"
+
+        db.drop_all()
+
+
 def test_admin_hubtel_log_returns_401_when_logged_out():
     app = _app_with_hubtel()
     with app.app_context():

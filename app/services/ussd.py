@@ -9,6 +9,7 @@ raises for bad user input -- invalid input always re-shows the current
 screen with a short error, never a crash (see handle_interaction).
 """
 
+import logging
 import re
 from datetime import datetime, timezone
 
@@ -50,6 +51,8 @@ MIN_FITTED_NAME_LENGTH = 10
 
 NOMINEE_CODE_PATTERN = re.compile(r"^[A-Z]{1,3}\d{2,3}$")
 
+logger = logging.getLogger(__name__)
+
 
 def _naive_utc_now():
     """Matches how VotingSettings' dates are stored (see
@@ -69,12 +72,23 @@ def handle_interaction(body, now=None):
 
     session_id = body.get("SessionId", "")
     raw_message = (body.get("Message") or "").strip()
-    request_type = body.get("Type")
+    request_type_raw = body.get("Type")
+    # Hubtel's Type is one of "Initiation", "Response" or "Timeout" (the
+    # user cancelled) -- compared case-insensitively since the exact
+    # casing isn't guaranteed. Platform is "USSD", "Webstore" or
+    # "Hubtel-App" -- logged for visibility only; nothing below assumes
+    # USSD, and every response always carries the mandatory fields
+    # regardless (see _base_response).
+    request_type = (request_type_raw or "").strip().lower()
+    platform = body.get("Platform")
     phone = normalize_phone(body.get("Mobile")) or (body.get("Mobile") or "")
 
-    if request_type == "release":
-        # The user ended the session themselves -- no transaction, and
-        # nothing left to remember.
+    logger.info("Hubtel interaction: Type=%r Platform=%r", request_type_raw, platform)
+
+    if request_type in ("release", "timeout"):
+        # The user ended the session themselves, or it timed out -- no
+        # transaction, and nothing left to remember. "Release" is also
+        # Hubtel's own name for this same case in some of its docs.
         _delete_session(session_id)
         return _release(session_id, "Session ended.")
 

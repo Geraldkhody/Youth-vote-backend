@@ -70,24 +70,30 @@ def parse_status_response(raw_json):
     """Best-effort read of Hubtel's status-check response.
 
     Returns (status, amount_pesewas, provider_total_pesewas):
-    - status is one of "paid", "failed", "pending", "unknown".
+    - status is one of "paid", "unpaid", "refunded", "failed", "pending",
+      "unknown". Confirmed from Hubtel's docs (26 Nov 2026): the status
+      word is one of "Paid", "Unpaid" or "Refunded" -- "failed"/"pending"
+      are kept as a defensive fallback for older/other wording we'd
+      already seen, not something Hubtel's current docs promise.
     - amount_pesewas is the vote amount Hubtel reports being paid, in
       pesewas -- None unless confidently found.
     - provider_total_pesewas is Hubtel's full charged total (including
       their own fee), in pesewas -- None unless confidently found.
 
-    VERIFY: the real response format is NOT CAPTURED yet (see
-    docs/HUBTEL_USSD_NOTES.md). This guesses at commonly-used field names
-    ("Status"/"status"/"TransactionStatus" for the status, "Amount" for
-    the vote amount, "Total"/"AmountCharged" for Hubtel's total --
-    possibly nested under "Data", the way several of Hubtel's other APIs
-    shape their responses) and falls back to "unknown"/None for anything
-    it doesn't confidently recognise.
+    VERIFY: the exact field names carrying the status/amount are still
+    NOT CAPTURED (see docs/HUBTEL_USSD_NOTES.md). This guesses at
+    commonly-used field names ("Status"/"status"/"TransactionStatus" for
+    the status, "Amount" for the vote amount, "Total"/"AmountCharged"
+    for Hubtel's total -- possibly nested under "Data", the way several
+    of Hubtel's other APIs shape their responses) and falls back to
+    "unknown"/None for anything it doesn't confidently recognise.
 
     "unknown" must NEVER be treated as "paid". If this function can't
     positively confirm a payment, the only safe assumption is that it
     hasn't happened -- treating an unrecognised response as "paid" would
-    be the kind of bug that gives away free votes.
+    be the kind of bug that gives away free votes. Likewise "unpaid" is
+    never "failed": Hubtel's "Unpaid" means "not paid yet", not "this
+    attempt failed" -- it's meant to be treated like "pending".
     """
     if not isinstance(raw_json, dict):
         return "unknown", None, None
@@ -100,6 +106,10 @@ def parse_status_response(raw_json):
 
     if status_text in ("paid", "success", "successful", "completed"):
         status = "paid"
+    elif status_text == "unpaid":
+        status = "unpaid"
+    elif status_text == "refunded":
+        status = "refunded"
     elif status_text in ("failed", "failure", "declined", "cancelled", "canceled"):
         status = "failed"
     elif status_text in ("pending", "processing", "initiated"):

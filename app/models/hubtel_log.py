@@ -16,10 +16,16 @@ class HubtelLog(db.Model):
     __table_args__ = {"mysql_charset": "utf8mb4", "mysql_collate": "utf8mb4_unicode_ci"}
 
     id = db.Column(db.Integer, primary_key=True)
-    kind = db.Column(db.String(20), nullable=False)  # "interaction" or "fulfillment"
+    kind = db.Column(db.String(20), nullable=False)  # "interaction", "fulfillment", or "blocked"
     received_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     body = db.Column(db.JSON, nullable=True)
     response_status = db.Column(db.Integer, nullable=False)
+
+    # The client IP this request appeared to come from -- see
+    # app/services/hubtel.py's get_client_ip. Nullable because older rows
+    # (before this column existed) won't have one. Long enough for an
+    # IPv6 address.
+    source_ip = db.Column(db.String(45), nullable=True)
 
     def to_dict(self):
         return {
@@ -28,4 +34,5 @@ class HubtelLog(db.Model):
             "received_at": self.received_at.isoformat(),
             "body": self.body,
             "response_status": self.response_status,
+            "source_ip": self.source_ip,
         }

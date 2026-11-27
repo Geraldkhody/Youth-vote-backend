@@ -263,6 +263,109 @@ def test_inconclusive_status_changes_nothing(app, nominee_id, mock_kwargs):
         assert Vote.query.filter_by(transaction_id=transaction_id).count() == 0
 
 
+@pytest.mark.parametrize("status_word", ["Unpaid", "unpaid"])
+def test_unpaid_status_creates_no_vote_no_failure_stays_pending(app, nominee_id, status_word):
+    with app.app_context():
+        _open_voting()
+        transaction = _make_pending_transaction(nominee_id, "sess-unpaid")
+        transaction_id = transaction.id
+
+        with patch("app.services.hubtel_fulfilment.check_transaction_status",
+                   return_value=(200, {"Status": status_word})), \
+             patch("app.services.hubtel_fulfilment.requests.post") as mock_post:
+            process_hubtel_payment(transaction_id)
+            assert not mock_post.called
+
+        t = Transaction.query.filter_by(id=transaction_id).first()
+        assert t.status == "pending"
+        assert t.needs_review is False
+        assert Vote.query.filter_by(transaction_id=transaction_id).count() == 0
+
+        # The sweep checks it again on a later run -- nothing about this
+        # outcome stops that.
+        with patch("app.services.hubtel_fulfilment.check_transaction_status",
+                   return_value=(200, {"Status": "Paid", "Amount": str(Decimal(transaction.amount_pesewas) / 100)})) as mock_check, \
+             patch("app.services.hubtel_fulfilment.requests.post", return_value=MagicMock(status_code=200)):
+            t.created_at = _real_now() - timedelta(minutes=10)
+            t.last_status_check_at = _real_now() - timedelta(minutes=10)
+            db.session.commit()
+            app.test_cli_runner().invoke(args=["hubtel-sweep"])
+            assert mock_check.called
+
+        t = Transaction.query.filter_by(id=transaction_id).first()
+        assert t.status == "success"
+
+
+def test_refunded_with_no_vote_sets_needs_review_no_callback(app, nominee_id):
+    with app.app_context():
+        _open_voting()
+        transaction = _make_pending_transaction(nominee_id, "sess-refunded-novote")
+        transaction_id = transaction.id
+
+        with patch("app.services.hubtel_fulfilment.check_transaction_status",
+                   return_value=(200, {"Status": "Refunded"})), \
+             patch("app.services.hubtel_fulfilment.requests.post") as mock_post:
+            process_hubtel_payment(transaction_id)
+            assert not mock_post.called
+
+        t = Transaction.query.filter_by(id=transaction_id).first()
+        assert t.status == "pending"
+        assert t.needs_review is True
+        assert t.review_reason == "refunded by Hubtel"
+        assert Vote.query.filter_by(transaction_id=transaction_id).count() == 0
+
+
+def test_refunded_after_vote_leaves_vote_untouched_sets_needs_review(app, nominee_id):
+    with app.app_context():
+        _open_voting()
+        transaction = _make_pending_transaction(nominee_id, "sess-refunded-postvote")
+        record_successful_payment(transaction.id, paid_amount_pesewas=transaction.amount_pesewas, now=NOW)
+        transaction_id = transaction.id
+
+        with patch("app.services.hubtel_fulfilment.check_transaction_status",
+                   return_value=(200, {"Status": "Refunded"})), \
+             patch("app.services.hubtel_fulfilment.requests.post") as mock_post:
+            process_hubtel_payment(transaction_id)
+            assert not mock_post.called
+
+        t = Transaction.query.filter_by(id=transaction_id).first()
+        assert t.status == "success"
+        assert t.needs_review is True
+        assert t.review_reason == "refunded after vote was recorded"
+        assert t.callback_sent_at is None
+        votes = Vote.query.filter_by(transaction_id=transaction_id).all()
+        assert len(votes) == 1
+        assert votes[0].quantity == transaction.quantity
+
+        # Even if something later tries to send the callback, needs_review
+        # blocks it.
+        t.hubtel_order_id = "ORDER-1"
+        db.session.commit()
+        with patch("app.services.hubtel_fulfilment.requests.post", return_value=MagicMock(status_code=200)) as mock_post:
+            send_final_callback(transaction_id)
+            assert not mock_post.called
+        t = Transaction.query.filter_by(id=transaction_id).first()
+        assert t.callback_sent_at is None
+
+
+def test_unknown_status_word_changes_nothing(app, nominee_id):
+    with app.app_context():
+        _open_voting()
+        transaction = _make_pending_transaction(nominee_id, "sess-unknown-word")
+        transaction_id = transaction.id
+
+        with patch("app.services.hubtel_fulfilment.check_transaction_status",
+                   return_value=(200, {"Status": "SomeBrandNewWord"})), \
+             patch("app.services.hubtel_fulfilment.requests.post") as mock_post:
+            process_hubtel_payment(transaction_id)
+            assert not mock_post.called
+
+        t = Transaction.query.filter_by(id=transaction_id).first()
+        assert t.status == "pending"
+        assert t.needs_review is False
+        assert Vote.query.filter_by(transaction_id=transaction_id).count() == 0
+
+
 def test_payment_confirmed_after_voting_closed_still_counts(app, nominee_id):
     with app.app_context():
         _open_voting()
@@ -415,6 +518,57 @@ def test_callback_stops_retrying_after_max_attempts(app, nominee_id):
         assert t.callback_attempts == MAX_CALLBACK_ATTEMPTS
 
 
+def test_callback_retries_fast_then_slow_then_gives_up_after_55_minutes(app, nominee_id):
+    """Uses a controllable clock (the `now` kwarg), never real sleeping."""
+    with app.app_context():
+        _open_voting()
+        transaction = _make_pending_transaction(nominee_id, "sess-callback-schedule")
+        record_successful_payment(transaction.id, paid_amount_pesewas=transaction.amount_pesewas, now=NOW)
+        t = Transaction.query.filter_by(id=transaction.id).first()
+        t.hubtel_order_id = "ORDER-1"
+        t.fulfilment_received_at = NOW
+        db.session.commit()
+        transaction_id = transaction.id
+
+        with patch("app.services.hubtel_fulfilment.requests.post", side_effect=Exception("still down")):
+            # Within the first 10 minutes: every call is retried, even
+            # just a minute after the last attempt (no cooldown applies).
+            send_final_callback(transaction_id, now=NOW + timedelta(minutes=2))
+            t = Transaction.query.filter_by(id=transaction_id).first()
+            assert t.callback_attempts == 1
+
+            send_final_callback(transaction_id, now=NOW + timedelta(minutes=3))
+            t = Transaction.query.filter_by(id=transaction_id).first()
+            assert t.callback_attempts == 2
+
+            send_final_callback(transaction_id, now=NOW + timedelta(minutes=9))
+            t = Transaction.query.filter_by(id=transaction_id).first()
+            assert t.callback_attempts == 3
+
+            # Past the 10-minute fast window, only 2 minutes after the
+            # last attempt (minute 9): NOT retried yet -- needs 5 minutes.
+            send_final_callback(transaction_id, now=NOW + timedelta(minutes=11))
+            t = Transaction.query.filter_by(id=transaction_id).first()
+            assert t.callback_attempts == 3
+
+            # 6 minutes after that last attempt: retried again.
+            send_final_callback(transaction_id, now=NOW + timedelta(minutes=15))
+            t = Transaction.query.filter_by(id=transaction_id).first()
+            assert t.callback_attempts == 4
+
+        # Past the 55-minute mark: stop retrying, flag for review instead.
+        with patch("app.services.hubtel_fulfilment.requests.post") as mock_post:
+            send_final_callback(transaction_id, now=NOW + timedelta(minutes=56))
+            assert not mock_post.called
+
+        t = Transaction.query.filter_by(id=transaction_id).first()
+        assert t.callback_sent_at is None
+        assert t.needs_review is True
+        assert t.review_reason == "final callback not sent within one hour"
+        # The vote itself is completely unaffected.
+        assert Vote.query.filter_by(transaction_id=transaction_id).count() == 1
+
+
 def test_callback_disabled_sends_nothing(nominee_id):
     app = create_app({
         "SQLALCHEMY_DATABASE_URI": TEST_DB_URI,
@@ -494,6 +648,27 @@ def test_sweep_marks_very_old_pending_as_needs_review(app, nominee_id):
         assert Vote.query.filter_by(transaction_id=stale_id).count() == 0
 
 
+def test_sweep_retries_pending_with_fulfilment_received_every_run(app, nominee_id):
+    """A transaction whose fulfilment we've received 1 minute ago is
+    still checked on this run -- the normal "5 minutes old" backstop rule
+    doesn't apply once we know fulfilment has happened."""
+    with app.app_context():
+        _open_voting()
+        real_now = _real_now()
+
+        transaction = _make_pending_transaction(nominee_id, "sess-fulfilled-recent")
+        transaction.created_at = real_now - timedelta(minutes=1)
+        transaction.fulfilment_received_at = real_now - timedelta(minutes=1)
+        db.session.commit()
+
+        with patch("app.services.hubtel_fulfilment.check_transaction_status",
+                   return_value=(200, {"Status": "Pending"})) as mock_check:
+            app.test_cli_runner().invoke(args=["hubtel-sweep"])
+
+        checked_refs = [call.args[0] for call in mock_check.call_args_list]
+        assert "sess-fulfilled-recent" in checked_refs
+
+
 def test_sweep_retries_a_failed_callback(app, nominee_id):
     with app.app_context():
         _open_voting()
@@ -524,6 +699,36 @@ def test_sweep_retries_a_failed_callback(app, nominee_id):
 def test_admin_transactions_list_requires_login(client):
     response = client.get("/api/admin/transactions")
     assert response.status_code == 401
+
+
+def test_admin_transactions_list_minutes_since_fulfilment_and_callback_overdue(app, logged_in_client, nominee_id):
+    with app.app_context():
+        _open_voting()
+        real_now = _real_now()
+
+        overdue = _make_pending_transaction(nominee_id, "sess-overdue")
+        record_successful_payment(overdue.id, paid_amount_pesewas=overdue.amount_pesewas, now=NOW)
+        overdue_row = Transaction.query.filter_by(id=overdue.id).first()
+        overdue_row.fulfilment_received_at = real_now - timedelta(minutes=45)
+        overdue_reference = overdue_row.reference
+        db.session.commit()
+
+        not_overdue = _make_pending_transaction(nominee_id, "sess-not-overdue")
+        record_successful_payment(not_overdue.id, paid_amount_pesewas=not_overdue.amount_pesewas, now=NOW)
+        not_overdue_row = Transaction.query.filter_by(id=not_overdue.id).first()
+        not_overdue_row.fulfilment_received_at = real_now - timedelta(minutes=5)
+        not_overdue_reference = not_overdue_row.reference
+        db.session.commit()
+
+    response = logged_in_client.get("/api/admin/transactions")
+    rows = {row["reference"]: row for row in response.get_json()}
+    assert rows[overdue_reference]["minutes_since_fulfilment"] >= 45
+    assert rows[not_overdue_reference]["minutes_since_fulfilment"] in (4, 5)
+
+    overdue_response = logged_in_client.get("/api/admin/transactions?callback_overdue=1")
+    overdue_refs = [row["reference"] for row in overdue_response.get_json()]
+    assert overdue_reference in overdue_refs
+    assert not_overdue_reference not in overdue_refs
 
 
 def test_admin_transactions_list_masks_phone(app, logged_in_client, nominee_id):

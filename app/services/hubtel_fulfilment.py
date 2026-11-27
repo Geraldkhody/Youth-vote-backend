@@ -31,6 +31,26 @@ from app.services.transactions import mark_payment_failed, record_successful_pay
 
 logger = logging.getLogger(__name__)
 
+# Hubtel requires the final callback within one hour of receiving the
+# fulfilment request (fulfilment_received_at) -- named so the sweep's
+# retry schedule (app/cli.py) and the admin "callback_overdue" filter
+# (app/routes/transactions_admin.py) can't drift out of sync with it.
+HUBTEL_CALLBACK_DEADLINE_MINUTES = 60
+
+# Safety margin before the one-hour deadline: once we're this far past
+# fulfilment with no callback sent, stop retrying and flag it for a
+# human instead of risking a retry landing after Hubtel's cutoff.
+CALLBACK_GIVE_UP_MINUTES = 55
+
+# Retry cadence once we know when fulfilment happened: no cooldown for
+# the first CALLBACK_FAST_RETRY_MINUTES (so a once-a-minute sweep run can
+# retry every time), then CALLBACK_SLOW_RETRY_COOLDOWN_SECONDS (5
+# minutes) between attempts. A transaction with no recorded fulfilment
+# time at all (shouldn't normally happen for a 'success' one) falls back
+# to the older, simpler CALLBACK_RETRY_COOLDOWN_SECONDS.
+CALLBACK_FAST_RETRY_MINUTES = 10
+CALLBACK_SLOW_RETRY_COOLDOWN_SECONDS = 300
+
 MAX_CALLBACK_ATTEMPTS = 10
 CALLBACK_RETRY_COOLDOWN_SECONDS = 120
 CALLBACK_TIMEOUT_SECONDS = 10
@@ -72,20 +92,31 @@ def handle_fulfilment_request(raw_json):
     return "processed"
 
 
-def process_hubtel_payment(transaction_id):
+def process_hubtel_payment(transaction_id, now=None):
     """Check Hubtel's status-check API for one transaction and act on
     the result. Safe to call repeatedly -- by the fulfilment endpoint, or
     later by the sweep -- since it never creates more than one vote (that
     guarantee lives in record_successful_payment, not here).
 
     The HTTP call to Hubtel happens with NO database row lock held.
+
+    now lets tests exercise the callback/retry schedule with a
+    controllable clock instead of real sleeping -- defaults to the real
+    current time.
     """
+    now = now if now is not None else _naive_utc_now()
     transaction = Transaction.query.filter_by(id=transaction_id).first()
     if transaction is None:
         return
 
-    if transaction.status != "pending":
-        # Nothing left to check -- already decided one way or the other.
+    # Normally only a 'pending' transaction has anything left to decide.
+    # A 'success' one is also let through here -- not to re-decide
+    # paid/failed (record_successful_payment/mark_payment_failed are both
+    # no-ops on an already-'success' row anyway), but so that if Hubtel
+    # pings us again after we've already recorded the vote, we still
+    # notice a "Refunded" status and can flag it (see the "refunded"
+    # branch below). Anything else ('failed'/'cancelled') is truly done.
+    if transaction.status not in ("pending", "success"):
         return
 
     reference_for_hubtel = transaction.hubtel_session_id or transaction.reference
@@ -106,29 +137,52 @@ def process_hubtel_payment(transaction_id):
         logger.warning("Hubtel status check failed for transaction %s: %s", transaction_id, error)
         status, amount_pesewas, provider_total_pesewas = "unknown", None, None
 
-    transaction.last_status_check_at = _naive_utc_now()
+    transaction.last_status_check_at = now
     db.session.commit()
+
+    if status == "refunded":
+        # No vote existed yet ('pending'): flag it, create nothing.
+        # A vote already existed ('success'): the vote is NOT touched or
+        # removed -- reversing it is an organisers' decision, not ours --
+        # just flagged for review, and no final callback is sent (see
+        # send_final_callback's needs_review check).
+        reason = (
+            "refunded after vote was recorded" if transaction.status == "success"
+            else "refunded by Hubtel"
+        )
+        transaction.needs_review = True
+        transaction.review_reason = reason
+        db.session.commit()
+        return
+
+    if transaction.status == "success":
+        # Already decided (and not refunded) -- nothing else to do.
+        return
 
     if status == "paid" and amount_pesewas is not None:
         record_successful_payment(
             transaction_id, paid_amount_pesewas=amount_pesewas,
-            provider_total_pesewas=provider_total_pesewas,
+            provider_total_pesewas=provider_total_pesewas, now=now,
         )
-        send_final_callback(transaction_id)
+        send_final_callback(transaction_id, now=now)
         return
 
     if status == "failed":
         mark_payment_failed(transaction_id, reason="Hubtel's status-check API reported this payment failed")
         return
 
-    # "pending", "unknown", a timeout/non-200 (surfaced above as
+    # "pending", "unpaid" (not paid yet -- treated the same as "pending",
+    # never as a failure), "unknown", a timeout/non-200 (surfaced above as
     # "unknown"), or "paid" without a confidently-read amount: change
     # nothing. The sweep (`flask hubtel-sweep`) will try again later.
 
 
-def send_final_callback(transaction_id):
+def send_final_callback(transaction_id, now=None):
     """Send Hubtel's final callback for one 'success' transaction, at
     most once.
+
+    now lets tests exercise the one-hour deadline with a controllable
+    clock instead of real sleeping -- defaults to the real current time.
 
     "At most once" is enforced with an atomic claim rather than a lock
     held across the HTTP call: one UPDATE sets callback_last_attempt_at
@@ -154,14 +208,53 @@ def send_final_callback(transaction_id):
     Never raises -- any error sending the callback is recorded on the
     transaction (callback_attempts, callback_last_error) instead.
     """
-    now = _naive_utc_now()
-    cooldown_cutoff = now - timedelta(seconds=CALLBACK_RETRY_COOLDOWN_SECONDS)
+    now = now if now is not None else _naive_utc_now()
+
+    # Hubtel's one-hour callback deadline, measured from
+    # fulfilment_received_at: once we're CALLBACK_GIVE_UP_MINUTES in with
+    # no callback sent, stop retrying and flag it instead of risking a
+    # retry landing after the real cutoff. Transactions with no recorded
+    # fulfilment time (shouldn't normally happen for a 'success' one, but
+    # defensively handled) skip this check -- there's no clock to measure
+    # against, so retries fall back to the attempt-count cap below.
+    pre_check = Transaction.query.filter_by(id=transaction_id).first()
+    if (
+        pre_check is not None
+        and pre_check.status == "success"
+        and pre_check.callback_sent_at is None
+        and pre_check.fulfilment_received_at is not None
+        and now - pre_check.fulfilment_received_at >= timedelta(minutes=CALLBACK_GIVE_UP_MINUTES)
+    ):
+        (
+            Transaction.query
+            .filter(Transaction.id == transaction_id)
+            .filter(Transaction.status == "success")
+            .filter(Transaction.callback_sent_at.is_(None))
+            .update({
+                "needs_review": True,
+                "review_reason": "final callback not sent within one hour",
+            }, synchronize_session=False)
+        )
+        db.session.commit()
+        return
+
+    if pre_check is not None and pre_check.fulfilment_received_at is not None:
+        minutes_since_fulfilment = (now - pre_check.fulfilment_received_at).total_seconds() / 60
+        cooldown_seconds = (
+            0 if minutes_since_fulfilment < CALLBACK_FAST_RETRY_MINUTES
+            else CALLBACK_SLOW_RETRY_COOLDOWN_SECONDS
+        )
+    else:
+        cooldown_seconds = CALLBACK_RETRY_COOLDOWN_SECONDS
+
+    cooldown_cutoff = now - timedelta(seconds=cooldown_seconds)
 
     claimed_rows = (
         Transaction.query
         .filter(Transaction.id == transaction_id)
         .filter(Transaction.status == "success")
         .filter(Transaction.callback_sent_at.is_(None))
+        .filter(Transaction.needs_review.is_(False))
         .filter(Transaction.hubtel_order_id.isnot(None))
         .filter(Transaction.callback_attempts < MAX_CALLBACK_ATTEMPTS)
         .filter(db.or_(
