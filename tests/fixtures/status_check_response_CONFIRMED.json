@@ -1,0 +1,7 @@
+{
+  "_note": "CONFIRMED real Hubtel status-check response shape, captured 28 Nov 2026 via scripts/check_hubtel_status.py against a real paid transaction (a GH₵1.00 vote fee). Amount is the gross amount charged to the payer (includes Hubtel's own fee); AmountAfterCharges is the net amount that must match Transaction.amount_pesewas.",
+  "Status": "Paid",
+  "Amount": "5.10",
+  "Charges": "0.10",
+  "AmountAfterCharges": "5.00"
+}

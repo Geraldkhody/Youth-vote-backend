@@ -35,6 +35,7 @@ from app.services.hubtel_fulfilment import (
     process_hubtel_payment,
     send_final_callback,
 )
+from app.cli import STATUS_CHECK_GIVE_UP_HOURS
 from app.services.transactions import create_pending_transaction, record_successful_payment
 
 TEST_DB_NAME = "youth_vote_test"
@@ -144,8 +145,17 @@ def _make_pending_transaction(nominee_id_, session_id, quantity=2):
     )
 
 
-def _paid_status_json(amount_pesewas):
-    return {"Status": "Paid", "Amount": str(Decimal(amount_pesewas) / 100)}
+def _paid_status_json(amount_pesewas, gross_pesewas=None):
+    """A "Paid" status-check body. amount_pesewas is the NET amount
+    (AmountAfterCharges) -- the figure compared against
+    Transaction.amount_pesewas. gross_pesewas (Amount, including
+    Hubtel's own fee) defaults to the same value when not given."""
+    gross_pesewas = gross_pesewas if gross_pesewas is not None else amount_pesewas
+    return {
+        "Status": "Paid",
+        "Amount": str(Decimal(gross_pesewas) / 100),
+        "AmountAfterCharges": str(Decimal(amount_pesewas) / 100),
+    }
 
 
 # ---------------------------------------------------------------------
@@ -175,9 +185,39 @@ def test_valid_paid_amount_creates_vote_and_sends_callback_once(app, nominee_id)
         t = Transaction.query.filter_by(id=transaction_id).first()
         assert t.status == "success"
         assert t.callback_sent_at is not None
+        assert t.last_status_outcome == "paid"
+        assert t.last_status_note is None
         votes = Vote.query.filter_by(transaction_id=transaction_id).all()
         assert len(votes) == 1
         assert votes[0].quantity == transaction.quantity
+
+
+def test_real_captured_gross_vs_net_body_records_one_vote(app, nominee_id):
+    """Regression test for the real-world bug: Hubtel's status-check
+    response for a 100-pesewa vote fee came back as
+    Amount=1.01/Charges=0.01/AmountAfterCharges=1.00 -- the gross amount
+    (1.01) includes Hubtel's own fee, so comparing against it instead of
+    the net AmountAfterCharges (1.00) made a genuinely paid transaction
+    look like an amount mismatch and get stuck 'pending'."""
+    with app.app_context():
+        _open_voting(fee_pesewas=100)
+        transaction = _make_pending_transaction(nominee_id, "sess-real-gross-net", quantity=1)
+        transaction_id = transaction.id
+        assert transaction.amount_pesewas == 100
+
+        real_body = {"Status": "Paid", "Amount": "1.01", "Charges": "0.01", "AmountAfterCharges": "1.0"}
+
+        with patch("app.services.hubtel_fulfilment.check_transaction_status",
+                   return_value=(200, real_body)), \
+             patch("app.services.hubtel_fulfilment.requests.post", return_value=MagicMock(status_code=200)):
+            process_hubtel_payment(transaction_id)
+
+        t = Transaction.query.filter_by(id=transaction_id).first()
+        assert t.status == "success"
+        assert t.needs_review is False
+        assert t.last_status_outcome == "paid"
+        assert t.last_status_note is None
+        assert Vote.query.filter_by(transaction_id=transaction_id).count() == 1
 
 
 def test_same_fulfilment_request_twice_creates_one_vote_and_one_callback(app, nominee_id):
@@ -219,6 +259,37 @@ def test_wrong_amount_creates_no_vote_sets_needs_review_sends_no_callback(app, n
         assert t.status == "pending"
         assert t.needs_review is True
         assert Vote.query.filter_by(transaction_id=transaction_id).count() == 0
+        assert t.last_status_outcome == "paid"
+        assert t.last_status_note == f"amount mismatch: expected {transaction.amount_pesewas} got {wrong_amount}"
+
+
+def test_order_id_mismatch_creates_no_vote_sends_no_callback(app, nominee_id):
+    """A new safety check: if Hubtel's status-check response reports an
+    OrderId that doesn't match the one we learned from the fulfilment
+    request, the payment is never confirmed -- even though the status
+    word says "Paid" and the amount matches exactly."""
+    with app.app_context():
+        _open_voting()
+        transaction = _make_pending_transaction(nominee_id, "sess-order-mismatch")
+        transaction_id = transaction.id
+        paid_body = _paid_status_json(transaction.amount_pesewas)
+        paid_body["OrderId"] = "ORDER-WRONG"
+
+        with patch("app.services.hubtel_fulfilment.check_transaction_status",
+                   return_value=(200, paid_body)), \
+             patch("app.services.hubtel_fulfilment.requests.post") as mock_post:
+
+            handle_fulfilment_request({"SessionId": "sess-order-mismatch", "OrderId": "ORDER-RIGHT"})
+
+            assert not mock_post.called
+
+        t = Transaction.query.filter_by(id=transaction_id).first()
+        assert t.hubtel_order_id == "ORDER-RIGHT"
+        assert t.status == "pending"
+        assert t.needs_review is False
+        assert Vote.query.filter_by(transaction_id=transaction_id).count() == 0
+        assert t.last_status_outcome == "paid"
+        assert t.last_status_note == "order id mismatch"
 
 
 def test_mocked_failed_status_marks_failed_no_vote_no_callback(app, nominee_id):
@@ -263,6 +334,40 @@ def test_inconclusive_status_changes_nothing(app, nominee_id, mock_kwargs):
         assert Vote.query.filter_by(transaction_id=transaction_id).count() == 0
 
 
+@pytest.mark.parametrize("mock_kwargs,expected_outcome,expected_note", [
+    ({"return_value": (403, None)}, "error", "HTTP 403"),
+    ({"side_effect": "timeout"}, "error", "timeout"),
+    ({"return_value": (200, {"Status": "SomeBrandNewWord"})}, "unknown", "unrecognised status word 'SomeBrandNewWord'"),
+])
+def test_status_check_outcomes_are_recorded_on_the_transaction(app, nominee_id, mock_kwargs, expected_outcome, expected_note):
+    """Every status check -- including a failed one -- sets
+    last_status_outcome/last_status_note, even though none of these
+    create a vote, so an admin can see WHY a transaction is stuck."""
+    with app.app_context():
+        _open_voting()
+        transaction = _make_pending_transaction(nominee_id, "sess-outcome-" + expected_outcome + "-" + expected_note[:4])
+        transaction_id = transaction.id
+
+        if "side_effect" in mock_kwargs and mock_kwargs["side_effect"] == "timeout":
+            patch_kwargs = {"side_effect": HubtelError("could not reach Hubtel's status-check API: Timeout", kind="timeout")}
+        elif mock_kwargs["return_value"][0] == 403:
+            patch_kwargs = {"side_effect": HubtelError("Hubtel's status-check API returned HTTP 403", kind="http", status_code=403)}
+        else:
+            patch_kwargs = mock_kwargs
+
+        with patch("app.services.hubtel_fulfilment.check_transaction_status", **patch_kwargs), \
+             patch("app.services.hubtel_fulfilment.requests.post") as mock_post:
+            process_hubtel_payment(transaction_id)
+            assert not mock_post.called
+
+        t = Transaction.query.filter_by(id=transaction_id).first()
+        assert t.status == "pending"
+        assert Vote.query.filter_by(transaction_id=transaction_id).count() == 0
+        assert t.last_status_outcome == expected_outcome
+        assert t.last_status_note == expected_note
+        assert t.last_status_check_at is not None
+
+
 @pytest.mark.parametrize("status_word", ["Unpaid", "unpaid"])
 def test_unpaid_status_creates_no_vote_no_failure_stays_pending(app, nominee_id, status_word):
     with app.app_context():
@@ -284,7 +389,7 @@ def test_unpaid_status_creates_no_vote_no_failure_stays_pending(app, nominee_id,
         # The sweep checks it again on a later run -- nothing about this
         # outcome stops that.
         with patch("app.services.hubtel_fulfilment.check_transaction_status",
-                   return_value=(200, {"Status": "Paid", "Amount": str(Decimal(transaction.amount_pesewas) / 100)})) as mock_check, \
+                   return_value=(200, _paid_status_json(transaction.amount_pesewas))) as mock_check, \
              patch("app.services.hubtel_fulfilment.requests.post", return_value=MagicMock(status_code=200)):
             t.created_at = _real_now() - timedelta(minutes=10)
             t.last_status_check_at = _real_now() - timedelta(minutes=10)
@@ -424,6 +529,53 @@ def test_concurrent_fulfilment_requests_create_one_vote_and_one_callback(app, no
 
     with app.app_context():
         assert Vote.query.filter_by(transaction_id=transaction_id).count() == 1
+
+
+def test_simultaneous_fulfilment_requests_give_exactly_one_successful_transaction(app, nominee_id):
+    """Same race as the test above, but checked from the transaction's
+    side rather than the vote's: two simultaneous fulfilment requests
+    for the same payment must leave exactly one transaction row, with
+    status 'success' and exactly one vote of the right quantity -- never
+    two votes, and never a transaction stuck in some other state."""
+    with app.app_context():
+        _open_voting()
+        transaction = _make_pending_transaction(nominee_id, "sess-concurrent-fulfil-2")
+        transaction_id = transaction.id
+        amount = transaction.amount_pesewas
+        quantity = transaction.quantity
+
+    barrier = threading.Barrier(2)
+    errors = []
+    mock_post = MagicMock(return_value=MagicMock(status_code=200))
+
+    def worker():
+        try:
+            barrier.wait(timeout=5)
+            with app.app_context():
+                handle_fulfilment_request({"SessionId": "sess-concurrent-fulfil-2", "OrderId": "ORDER-Y"})
+        except Exception as error:
+            errors.append(error)
+
+    with patch("app.services.hubtel_fulfilment.check_transaction_status",
+               return_value=(200, _paid_status_json(amount))), \
+         patch("app.services.hubtel_fulfilment.requests.post", mock_post):
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+    assert errors == []
+    assert mock_post.call_count == 1
+
+    with app.app_context():
+        matching_transactions = Transaction.query.filter_by(id=transaction_id).all()
+        assert len(matching_transactions) == 1
+        assert matching_transactions[0].status == "success"
+
+        votes = Vote.query.filter_by(transaction_id=transaction_id).all()
+        assert len(votes) == 1
+        assert votes[0].quantity == quantity
 
 
 def test_two_overlapping_callback_attempts_send_only_one(app, nominee_id):
@@ -648,6 +800,104 @@ def test_sweep_marks_very_old_pending_as_needs_review(app, nominee_id):
         assert Vote.query.filter_by(transaction_id=stale_id).count() == 0
 
 
+def test_sweep_never_hides_a_fulfilled_payment_past_24_hours(app, nominee_id):
+    """The 24-hour give-up rule (step 2 of the sweep) must never hide a
+    payment: a transaction whose fulfilment we've received is
+    status-checked FIRST in this same sweep run, even past the 24-hour
+    give-up mark, and Hubtel confirming it as paid always creates the
+    vote and marks the transaction 'success' -- no exception.
+
+    This transaction's fulfilment also happened 30 hours ago, though,
+    which is well past Hubtel's separate one-hour final-callback
+    deadline (CALLBACK_GIVE_UP_MINUTES in hubtel_fulfilment.py) -- so
+    send_final_callback correctly refuses to even attempt the callback
+    and flags needs_review for THAT reason. The vote still counts; only
+    a human follow-up on the callback is needed. See the test below for
+    the same payment confirmed well within the callback window, where
+    needs_review stays False."""
+    with app.app_context():
+        _open_voting()
+        real_now = _real_now()
+
+        transaction = _make_pending_transaction(nominee_id, "sess-fulfilled-30h-paid")
+        transaction.created_at = real_now - timedelta(hours=STATUS_CHECK_GIVE_UP_HOURS + 6)
+        transaction.fulfilment_received_at = real_now - timedelta(hours=STATUS_CHECK_GIVE_UP_HOURS + 6)
+        db.session.commit()
+        transaction_id = transaction.id
+        amount = transaction.amount_pesewas
+        quantity = transaction.quantity
+
+        with patch("app.services.hubtel_fulfilment.check_transaction_status",
+                   return_value=(200, _paid_status_json(amount))), \
+             patch("app.services.hubtel_fulfilment.requests.post", return_value=MagicMock(status_code=200)):
+            app.test_cli_runner().invoke(args=["hubtel-sweep"])
+
+        t = Transaction.query.filter_by(id=transaction_id).first()
+        assert t.status == "success"
+        votes = Vote.query.filter_by(transaction_id=transaction_id).all()
+        assert len(votes) == 1
+        assert votes[0].quantity == quantity
+        assert t.needs_review is True
+        assert "callback" in t.review_reason
+        assert t.review_reason != "fulfilment received but not confirmed after 24 hours"
+
+
+def test_sweep_leaves_needs_review_false_when_confirmed_within_the_callback_window(app, nominee_id):
+    """Same scenario as above, except fulfilment happened recently
+    (well within Hubtel's one-hour final-callback deadline) -- the
+    payment is recorded as a vote AND the final callback goes out, so
+    needs_review stays False."""
+    with app.app_context():
+        _open_voting()
+        real_now = _real_now()
+
+        transaction = _make_pending_transaction(nominee_id, "sess-fulfilled-recent-paid")
+        transaction.created_at = real_now - timedelta(minutes=2)
+        transaction.fulfilment_received_at = real_now - timedelta(minutes=2)
+        transaction.hubtel_order_id = "ORDER-RECENT"
+        db.session.commit()
+        transaction_id = transaction.id
+        amount = transaction.amount_pesewas
+        quantity = transaction.quantity
+
+        with patch("app.services.hubtel_fulfilment.check_transaction_status",
+                   return_value=(200, _paid_status_json(amount))), \
+             patch("app.services.hubtel_fulfilment.requests.post", return_value=MagicMock(status_code=200)):
+            app.test_cli_runner().invoke(args=["hubtel-sweep"])
+
+        t = Transaction.query.filter_by(id=transaction_id).first()
+        assert t.status == "success"
+        votes = Vote.query.filter_by(transaction_id=transaction_id).all()
+        assert len(votes) == 1
+        assert votes[0].quantity == quantity
+        assert t.needs_review is False
+        assert t.callback_sent_at is not None
+
+
+def test_sweep_still_times_out_a_transaction_with_no_fulfilment_after_24_hours(app, nominee_id):
+    """Unaffected by the fix above: a transaction that never received a
+    fulfilment ping at all keeps the original, simpler age-only
+    behaviour."""
+    with app.app_context():
+        _open_voting()
+        real_now = _real_now()
+
+        transaction = _make_pending_transaction(nominee_id, "sess-no-fulfilment-30h")
+        transaction.created_at = real_now - timedelta(hours=STATUS_CHECK_GIVE_UP_HOURS + 6)
+        db.session.commit()
+        transaction_id = transaction.id
+
+        with patch("app.services.hubtel_fulfilment.check_transaction_status",
+                   return_value=(200, {"Status": "Pending"})):
+            app.test_cli_runner().invoke(args=["hubtel-sweep"])
+
+        t = Transaction.query.filter_by(id=transaction_id).first()
+        assert t.needs_review is True
+        assert t.review_reason == "no final status after 24 hours"
+        assert t.status == "pending"
+        assert Vote.query.filter_by(transaction_id=transaction_id).count() == 0
+
+
 def test_sweep_retries_pending_with_fulfilment_received_every_run(app, nominee_id):
     """A transaction whose fulfilment we've received 1 minute ago is
     still checked on this run -- the normal "5 minutes old" backstop rule
@@ -744,6 +994,24 @@ def test_admin_transactions_list_masks_phone(app, logged_in_client, nominee_id):
     assert "233241234567" not in str(rows[0])
     assert rows[0]["nominee_code"] == "A47"
     assert rows[0]["quantity"] == 3
+
+
+def test_admin_transactions_list_shows_last_status_outcome_and_note(app, logged_in_client, nominee_id):
+    with app.app_context():
+        _open_voting()
+        transaction = _make_pending_transaction(nominee_id, "sess-admin-outcome")
+        expected_amount = transaction.amount_pesewas
+        wrong_amount = expected_amount + 1
+        reference = transaction.reference
+
+        with patch("app.services.hubtel_fulfilment.check_transaction_status",
+                   return_value=(200, _paid_status_json(wrong_amount))):
+            process_hubtel_payment(transaction.id)
+
+    response = logged_in_client.get("/api/admin/transactions")
+    rows = {row["reference"]: row for row in response.get_json()}
+    assert rows[reference]["last_status_outcome"] == "paid"
+    assert rows[reference]["last_status_note"] == f"amount mismatch: expected {expected_amount} got {wrong_amount}"
 
 
 # ---------------------------------------------------------------------

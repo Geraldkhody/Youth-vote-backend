@@ -104,11 +104,29 @@ Our reading is that `clientReference` is the USSD `SessionId`. **VERIFY.**
 - Anything else: `"unknown"`, logged safely (no personal data), never
   treated as `"paid"`.
 
+**CONFIRMED (28 Nov 2026, via `scripts/check_hubtel_status.py` against a
+real paid transaction):** the amount fields are `Amount` (the gross
+amount the payer was actually charged, INCLUDING Hubtel's own fee),
+`Charges` (Hubtel's fee alone) and `AmountAfterCharges` (the net amount
+left once Hubtel's fee is deducted). For a GH₵1.00 vote fee, a real
+response looked like `Amount: "1.01"`, `Charges: "0.01"`,
+`AmountAfterCharges: "1.00"`. **The vote amount we compare against
+`Transaction.amount_pesewas` is `AmountAfterCharges`, never `Amount`** --
+comparing against `Amount` was a real bug that made a genuinely paid
+transaction look like an amount mismatch (flagged `needs_review`,
+stuck `'pending'`, no vote). `Amount` is still read, as
+`provider_total_pesewas`, for reporting only.
+
 **STILL UNKNOWN — VERIFY:**
-- The exact field names carrying the status word and amount. Our client
-  (`app/providers/hubtel_adapter.py`) makes a conservative best guess at
-  parsing them and defaults to `"unknown"` for anything unrecognised --
-  `"unknown"` is never treated as `"paid"`.
+- The exact field name for the status word itself is still a best
+  guess (`app/providers/hubtel_adapter.py` tries `"Status"`/`"status"`/
+  `"TransactionStatus"` and defaults to `"unknown"` for anything
+  unrecognised -- `"unknown"` is never treated as `"paid"`).
+- Whether `OrderId` is ever present in the status-check response itself
+  (as opposed to only the fulfilment request) -- `app/providers/hubtel_adapter.py`
+  checks for it defensively (`find_order_id_in_status_response`) and, when
+  present, it must match the `OrderId` already learned from the
+  fulfilment request or the payment is not confirmed.
 - The fulfilment request body (still just logged, not parsed, beyond
   `SessionId`/`OrderId`).
 - The final callback body.

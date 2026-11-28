@@ -18,7 +18,18 @@ class HubtelError(Exception):
     """Raised when the status-check call can't be completed, or Hubtel
     returns something other than a 200. The message is always safe to log
     or show -- it never includes HUBTEL_API_SECRET or any other
-    credential."""
+    credential.
+
+    kind and status_code let callers (process_hubtel_payment,
+    scripts/explain_transaction.py) build a short, safe
+    last_status_note ("HTTP 403", "timeout") without re-parsing the
+    message text. kind is one of "config", "network", "timeout", "http".
+    """
+
+    def __init__(self, message, kind="network", status_code=None):
+        super().__init__(message)
+        self.kind = kind
+        self.status_code = status_code
 
 
 def _require_config():
@@ -31,7 +42,8 @@ def _require_config():
         raise HubtelError(
             "Hubtel status-check configuration is incomplete -- set "
             "HUBTEL_COLLECTION_ACCOUNT, HUBTEL_API_ID, HUBTEL_API_SECRET "
-            "and HUBTEL_STATUS_BASE_URL."
+            "and HUBTEL_STATUS_BASE_URL.",
+            kind="config",
         )
 
     return collection_account, api_id, api_secret, base_url
@@ -63,10 +75,19 @@ def check_transaction_status(client_reference):
             headers={"Authorization": _basic_auth_header(api_id, api_secret)},
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
+    except requests.Timeout as error:
+        raise HubtelError(
+            f"could not reach Hubtel's status-check API: {type(error).__name__}", kind="timeout",
+        ) from error
     except requests.RequestException as error:
-        raise HubtelError(f"could not reach Hubtel's status-check API: {type(error).__name__}") from error
+        raise HubtelError(
+            f"could not reach Hubtel's status-check API: {type(error).__name__}", kind="network",
+        ) from error
 
     if response.status_code != 200:
-        raise HubtelError(f"Hubtel's status-check API returned HTTP {response.status_code}")
+        raise HubtelError(
+            f"Hubtel's status-check API returned HTTP {response.status_code}",
+            kind="http", status_code=response.status_code,
+        )
 
     return response.status_code, response.json()

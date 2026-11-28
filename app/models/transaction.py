@@ -91,14 +91,31 @@ class Transaction(db.Model):
     fulfilment_received_at = db.Column(db.DateTime, nullable=True)
     last_status_check_at = db.Column(db.DateTime, nullable=True)
 
+    # Set after EVERY status check (see process_hubtel_payment), success or
+    # failure, so an admin -- or scripts/explain_transaction.py -- can see
+    # exactly why a payment did or didn't turn into a vote, without having
+    # to reconstruct it from logs. last_status_outcome is always one of
+    # "paid", "unpaid", "refunded", "unknown", "error". last_status_note is
+    # a short, safe (no personal data/secrets) explanation, e.g. "HTTP 403",
+    # "timeout", "amount mismatch: expected 100 got 101".
+    last_status_outcome = db.Column(db.String(20), nullable=True)
+    last_status_note = db.Column(db.String(255), nullable=True)
+
     # The final callback to Hubtel: sent at most once, for a 'success'
-    # transaction only. callback_last_attempt_at also doubles as a claim
-    # token so two overlapping attempts can't both send it -- see
-    # send_final_callback() for how.
+    # transaction only. callback_claim_token is the real mutual-exclusion
+    # mechanism -- see send_final_callback() for how it (not the
+    # timestamp columns) is what stops two overlapping attempts from both
+    # sending it.
     callback_sent_at = db.Column(db.DateTime, nullable=True)
     callback_attempts = db.Column(db.Integer, nullable=False, default=0)
     callback_last_attempt_at = db.Column(db.DateTime, nullable=True)
     callback_last_error = db.Column(db.Text, nullable=True)
+
+    # Set to a fresh random value while one request "owns" the right to
+    # send the final callback, and cleared again once it's done (sent or
+    # failed) -- see send_final_callback(). NULL means nobody currently
+    # holds the claim.
+    callback_claim_token = db.Column(db.String(32), nullable=True)
 
     nominee = db.relationship("Nominee")
 
@@ -123,6 +140,8 @@ class Transaction(db.Model):
             "hubtel_order_id": self.hubtel_order_id,
             "fulfilment_received_at": self.fulfilment_received_at.isoformat() if self.fulfilment_received_at else None,
             "last_status_check_at": self.last_status_check_at.isoformat() if self.last_status_check_at else None,
+            "last_status_outcome": self.last_status_outcome,
+            "last_status_note": self.last_status_note,
             "callback_sent_at": self.callback_sent_at.isoformat() if self.callback_sent_at else None,
             "callback_attempts": self.callback_attempts,
             "callback_last_attempt_at": self.callback_last_attempt_at.isoformat() if self.callback_last_attempt_at else None,

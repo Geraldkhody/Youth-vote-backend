@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from app.providers.hubtel_adapter import parse_fulfilment_request, parse_status_response
+from app.providers.hubtel_adapter import (
+    find_order_id_in_status_response,
+    parse_fulfilment_request,
+    parse_status_response,
+    raw_status_text,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -54,10 +59,12 @@ def test_does_not_look_at_other_field_names():
 # parse_status_response
 # ---------------------------------------------------------------------
 
-def test_parses_the_assumed_status_fixture():
-    raw_json = _load_fixture("status_check_response_ASSUMED.json")
+def test_parses_the_confirmed_status_fixture():
+    raw_json = _load_fixture("status_check_response_CONFIRMED.json")
     status, amount_pesewas, provider_total_pesewas = parse_status_response(raw_json)
     assert status == "paid"
+    # AmountAfterCharges (net, what must match the vote amount) -- never
+    # Amount (gross, includes Hubtel's own fee).
     assert amount_pesewas == 500
     assert provider_total_pesewas == 510
 
@@ -107,7 +114,38 @@ def test_amount_uses_decimal_not_float_and_round_trips_exactly():
     # 0.1 + 0.2 != 0.3 in float -- this amount would expose that if the
     # parsing ever switched to float math.
     status, amount_pesewas, provider_total_pesewas = parse_status_response({
-        "Status": "Paid", "Amount": "5.10", "Total": "5.20",
+        "Status": "Paid", "AmountAfterCharges": "5.10", "Amount": "5.20",
     })
     assert amount_pesewas == 510
     assert provider_total_pesewas == 520
+
+
+def test_amount_pesewas_uses_amount_after_charges_not_gross_amount():
+    # The real-world bug this guards against: Hubtel's gross "Amount"
+    # includes their own fee on top, so comparing it against the vote
+    # amount makes a genuinely paid transaction look like a mismatch.
+    status, amount_pesewas, provider_total_pesewas = parse_status_response({
+        "Status": "Paid", "Amount": "1.01", "Charges": "0.01", "AmountAfterCharges": "1.00",
+    })
+    assert status == "paid"
+    assert amount_pesewas == 100
+    assert provider_total_pesewas == 101
+
+
+# ---------------------------------------------------------------------
+# raw_status_text / find_order_id_in_status_response
+# ---------------------------------------------------------------------
+
+def test_raw_status_text_returns_original_casing():
+    assert raw_status_text({"Status": "Paid"}) == "Paid"
+    assert raw_status_text({"Status": "SomeBrandNewWord"}) == "SomeBrandNewWord"
+    assert raw_status_text({}) == ""
+    assert raw_status_text(None) == ""
+
+
+def test_find_order_id_in_status_response():
+    assert find_order_id_in_status_response({"OrderId": "ORDER-1"}) == "ORDER-1"
+    assert find_order_id_in_status_response({"Data": {"OrderId": "ORDER-2"}}) == "ORDER-2"
+    assert find_order_id_in_status_response({}) is None
+    assert find_order_id_in_status_response({"OrderId": 123}) is None
+    assert find_order_id_in_status_response(None) is None

@@ -81,6 +81,13 @@ def register_cli(app):
         checked = 0
         timed_out = 0
         retried = 0
+        outcome_counts = {"paid": 0, "unpaid": 0, "refunded": 0, "unknown": 0, "error": 0}
+
+        def _check_and_tally(transaction):
+            process_hubtel_payment(transaction.id, now=now)
+            refreshed = Transaction.query.filter_by(id=transaction.id).first()
+            if refreshed is not None and refreshed.last_status_outcome in outcome_counts:
+                outcome_counts[refreshed.last_status_outcome] += 1
 
         # 1a. Pending transactions whose fulfilment we've already
         # received: retry every run for the first
@@ -104,7 +111,7 @@ def register_cli(app):
             .all()
         )
         for transaction in fulfilled_pending_candidates:
-            process_hubtel_payment(transaction.id)
+            _check_and_tally(transaction)
             checked += 1
         budget -= checked
 
@@ -127,7 +134,7 @@ def register_cli(app):
                 .all()
             )
             for transaction in check_candidates:
-                process_hubtel_payment(transaction.id)
+                _check_and_tally(transaction)
                 checked += 1
             budget -= len(check_candidates)
 
@@ -135,6 +142,17 @@ def register_cli(app):
         # status or callback ever arrived. Measured from
         # fulfilment_received_at when we have it (that's when Hubtel's
         # own clock really started); otherwise from created_at.
+        #
+        # A transaction whose fulfilment we've received must NEVER be
+        # given up on before it's actually been status-checked at least
+        # once (last_status_check_at is not None) -- step 1a above always
+        # checks it first in this very run if it's due, but this extra
+        # guard also covers a transaction that, for whatever reason (the
+        # sweep not having run, a bug), was never checked at all: without
+        # it, a genuinely paid transaction could be flagged needs_review
+        # -- effectively hiding the payment -- without Hubtel ever having
+        # been asked about it. A transaction with no fulfilment at all
+        # keeps the original, simpler age-only rule.
         if budget > 0:
             give_up_cutoff = now - timedelta(hours=STATUS_CHECK_GIVE_UP_HOURS)
             timeout_candidates = (
@@ -144,6 +162,7 @@ def register_cli(app):
                     db.and_(
                         Transaction.fulfilment_received_at.isnot(None),
                         Transaction.fulfilment_received_at < give_up_cutoff,
+                        Transaction.last_status_check_at.isnot(None),
                     ),
                     db.and_(
                         Transaction.fulfilment_received_at.is_(None),
@@ -156,7 +175,11 @@ def register_cli(app):
             )
             for transaction in timeout_candidates:
                 transaction.needs_review = True
-                transaction.review_reason = "no final status after 24 hours"
+                transaction.review_reason = (
+                    "fulfilment received but not confirmed after 24 hours"
+                    if transaction.fulfilment_received_at is not None
+                    else "no final status after 24 hours"
+                )
             if timeout_candidates:
                 db.session.commit()
             timed_out = len(timeout_candidates)
@@ -191,4 +214,10 @@ def register_cli(app):
                 send_final_callback(transaction.id)
                 retried += 1
 
-        click.echo(f"hubtel-sweep: checked {checked}, timed out {timed_out}, retried callback {retried}")
+        click.echo(
+            f"hubtel-sweep: checked {checked} "
+            f"(paid {outcome_counts['paid']}, unpaid {outcome_counts['unpaid']}, "
+            f"refunded {outcome_counts['refunded']}, unknown {outcome_counts['unknown']}, "
+            f"error {outcome_counts['error']}), "
+            f"timed out {timed_out}, retried callback {retried}"
+        )

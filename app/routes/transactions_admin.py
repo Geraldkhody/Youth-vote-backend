@@ -42,6 +42,8 @@ def _to_summary(transaction, now):
         "status": transaction.status,
         "needs_review": transaction.needs_review,
         "review_reason": transaction.review_reason,
+        "last_status_outcome": transaction.last_status_outcome,
+        "last_status_note": transaction.last_status_note,
         "callback_sent_at": transaction.callback_sent_at.isoformat() if transaction.callback_sent_at else None,
         "callback_attempts": transaction.callback_attempts,
         "created_at": transaction.created_at.isoformat(),

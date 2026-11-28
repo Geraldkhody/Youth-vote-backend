@@ -66,6 +66,38 @@ def _find_amount_pesewas(data, *field_names):
     return None
 
 
+def _status_data(raw_json):
+    """The dict to read status/amount/order-id fields from -- Hubtel
+    nests some of its other APIs' responses under "Data", so we check
+    there first if present."""
+    if not isinstance(raw_json, dict):
+        return {}
+    return raw_json.get("Data") if isinstance(raw_json.get("Data"), dict) else raw_json
+
+
+def raw_status_text(raw_json):
+    """The raw status word from a status-check response, exactly as
+    Hubtel sent it (not lower-cased), or "" if there isn't one. Used for
+    building a readable last_status_note when the word isn't one we
+    recognise -- shared by parse_status_response and
+    scripts/explain_transaction.py so the two never disagree."""
+    data = _status_data(raw_json)
+    return str(data.get("Status") or data.get("status") or data.get("TransactionStatus") or "").strip()
+
+
+def find_order_id_in_status_response(raw_json):
+    """Hubtel's own order id as reported by the status-check response,
+    or None if it isn't present. Compared against
+    Transaction.hubtel_order_id (learned from the fulfilment request) as
+    an extra safety check before a "Paid" status is trusted -- see
+    process_hubtel_payment."""
+    data = _status_data(raw_json)
+    order_id = data.get("OrderId")
+    if not isinstance(order_id, str) or not order_id:
+        order_id = data.get("orderId")
+    return order_id if isinstance(order_id, str) and order_id else None
+
+
 def parse_status_response(raw_json):
     """Best-effort read of Hubtel's status-check response.
 
@@ -80,13 +112,19 @@ def parse_status_response(raw_json):
     - provider_total_pesewas is Hubtel's full charged total (including
       their own fee), in pesewas -- None unless confidently found.
 
-    VERIFY: the exact field names carrying the status/amount are still
-    NOT CAPTURED (see docs/HUBTEL_USSD_NOTES.md). This guesses at
-    commonly-used field names ("Status"/"status"/"TransactionStatus" for
-    the status, "Amount" for the vote amount, "Total"/"AmountCharged"
-    for Hubtel's total -- possibly nested under "Data", the way several
-    of Hubtel's other APIs shape their responses) and falls back to
-    "unknown"/None for anything it doesn't confidently recognise.
+    CONFIRMED (28 Nov 2026, via scripts/check_hubtel_status.py against a
+    real paid transaction): Hubtel's response carries "Amount" (the gross
+    amount actually charged to the payer, INCLUDING Hubtel's own
+    "Charges" fee on top) and "AmountAfterCharges" (the net amount left
+    after Hubtel's fee is deducted). The vote amount we must compare
+    against Transaction.amount_pesewas is the NET figure --
+    "AmountAfterCharges" -- never the gross "Amount". Using "Amount" here
+    was the bug that made a genuinely paid transaction look like an
+    amount mismatch and get stuck needing review: a GH₵1.00 vote fee
+    comes back as Amount=1.01/Charges=0.01/AmountAfterCharges=1.00, and
+    only the last of those equals what we expect. "Amount" is kept as
+    provider_total_pesewas (for reporting only, never compared against
+    the expected amount).
 
     "unknown" must NEVER be treated as "paid". If this function can't
     positively confirm a payment, the only safe assumption is that it
@@ -98,11 +136,8 @@ def parse_status_response(raw_json):
     if not isinstance(raw_json, dict):
         return "unknown", None, None
 
-    data = raw_json.get("Data") if isinstance(raw_json.get("Data"), dict) else raw_json
-
-    status_text = str(
-        data.get("Status") or data.get("status") or data.get("TransactionStatus") or ""
-    ).strip().lower()
+    data = _status_data(raw_json)
+    status_text = raw_status_text(raw_json).lower()
 
     if status_text in ("paid", "success", "successful", "completed"):
         status = "paid"
@@ -117,7 +152,7 @@ def parse_status_response(raw_json):
     else:
         status = "unknown"
 
-    amount_pesewas = _find_amount_pesewas(data, "Amount", "amount")
-    provider_total_pesewas = _find_amount_pesewas(data, "Total", "AmountCharged", "total")
+    amount_pesewas = _find_amount_pesewas(data, "AmountAfterCharges", "amountAfterCharges")
+    provider_total_pesewas = _find_amount_pesewas(data, "Amount", "amount")
 
     return status, amount_pesewas, provider_total_pesewas
