@@ -104,34 +104,88 @@ Our reading is that `clientReference` is the USSD `SessionId`. **VERIFY.**
 - Anything else: `"unknown"`, logged safely (no personal data), never
   treated as `"paid"`.
 
-**CONFIRMED (28 Nov 2026, via `scripts/check_hubtel_status.py` against a
-real paid transaction):** the amount fields are `Amount` (the gross
-amount the payer was actually charged, INCLUDING Hubtel's own fee),
-`Charges` (Hubtel's fee alone) and `AmountAfterCharges` (the net amount
-left once Hubtel's fee is deducted). For a GH₵1.00 vote fee, a real
-response looked like `Amount: "1.01"`, `Charges: "0.01"`,
-`AmountAfterCharges: "1.00"`. **The vote amount we compare against
-`Transaction.amount_pesewas` is `AmountAfterCharges`, never `Amount`** --
-comparing against `Amount` was a real bug that made a genuinely paid
-transaction look like an amount mismatch (flagged `needs_review`,
-stuck `'pending'`, no vote). `Amount` is still read, as
-`provider_total_pesewas`, for reporting only.
+**SUPERSEDED (see 28 Nov 2026 entry below) -- kept for history only:** an
+earlier "CONFIRMED" note here claimed the amount fields were flat,
+capitalized top-level fields (`Amount`/`Charges`/`AmountAfterCharges`,
+no envelope). That claim was wrong, and every test mock in the repo
+copied it -- which is exactly how a real production bug (a genuinely
+paid transaction parsing as `"unknown"`) shipped without any test
+catching it. See the entry below for the shape actually confirmed by a
+real capture, and the "Testing discipline" note at the end of this
+section for how we're making sure that doesn't happen again.
+
+**CONFIRMED (28 Nov 2026, real capture -- a genuinely paid transaction's
+status-check response, saved verbatim at
+`tests/fixtures/hubtel_status_paid_REAL.json`):**
+
+```json
+{
+  "message": "Successful",
+  "responseCode": "0000",
+  "data": {
+    "status": "Paid",
+    "transactionId": "1cde0454d1bf408cbce2005bc2228111",
+    "amount": 1.01,
+    "charges": 0.01,
+    "amountAfterCharges": 1.0
+  }
+}
+```
+
+(trimmed to the fields that matter here -- see the fixture file for the
+full real body). Note everything is **lowercase**, and nested under a
+top-level `"data"` key, inside an envelope that also carries `"message"`
+and `"responseCode"`. The previous entry's flat, capitalized shape (no
+envelope at all) was never real.
+
+- `responseCode` must be exactly `"0000"` for a `"Paid"` status word to
+  be trusted at all -- this is Hubtel's own signal that the status-check
+  call succeeded and `data` means what it says.
+- The amount fields are `amount` (the gross amount the payer was
+  actually charged, INCLUDING Hubtel's own fee), `charges` (Hubtel's fee
+  alone) and `amountAfterCharges` (the net amount left once Hubtel's fee
+  is deducted). For a GH₵1.00 vote fee, the real capture above is
+  `amount: 1.01`, `charges: 0.01`, `amountAfterCharges: 1.0`. **The vote
+  amount we compare against `Transaction.amount_pesewas` is
+  `amountAfterCharges`, never `amount`** -- comparing against `amount`
+  was a real bug that made a genuinely paid transaction look like an
+  amount mismatch (flagged `needs_review`, stuck `'pending'`, no vote).
+  `amount` is still read, as `provider_total_pesewas`, for reporting
+  only. `app/providers/hubtel_adapter.py` also cross-checks that
+  `amount - charges == amountAfterCharges` exactly, and treats a
+  mismatch the same as an unreadable amount.
+- The status-check response reports Hubtel's own id for the payment as
+  `data.transactionId`, NOT `OrderId` -- `find_order_id_in_status_response`
+  checks `OrderId` first (in case a different endpoint or future version
+  uses it), then falls back to `transactionId`.
+- Field names (`data` vs `Data`, `status` vs `Status`, etc.) are matched
+  case-insensitively as a defensive safety net, but the casing above is
+  what's actually been seen -- never rely on the case-insensitive
+  fallback being the primary path.
 
 **STILL UNKNOWN — VERIFY:**
-- The exact field name for the status word itself is still a best
-  guess (`app/providers/hubtel_adapter.py` tries `"Status"`/`"status"`/
-  `"TransactionStatus"` and defaults to `"unknown"` for anything
-  unrecognised -- `"unknown"` is never treated as `"paid"`).
-- Whether `OrderId` is ever present in the status-check response itself
-  (as opposed to only the fulfilment request) -- `app/providers/hubtel_adapter.py`
-  checks for it defensively (`find_order_id_in_status_response`) and, when
-  present, it must match the `OrderId` already learned from the
-  fulfilment request or the payment is not confirmed.
+- Whether the fields above are always present, or sometimes missing/null
+  for a status other than `"Paid"` (the `"Unpaid"`/`"Refunded"` fixtures
+  under `tests/fixtures/` are explicitly marked `_DOCUMENTED`, not real
+  captures, until we see one).
 - The fulfilment request body (still just logged, not parsed, beyond
   `SessionId`/`OrderId`).
 - The final callback body.
 - The maximum length of `ItemName`. We keep it under 40 characters as a
   conservative guess -- still unconfirmed.
+
+**Testing discipline:** tests for Hubtel parsing must use real captured
+bodies, never invented ones. A fixture file named `*_REAL*` must be a
+genuine capture (or, where part of it genuinely isn't available, say so
+honestly in its own `_note` field and leave that part out -- never
+invent a plausible-looking placeholder). A fixture that's a stand-in for
+something we haven't captured yet must be named `*_ASSUMED*` or
+`*_DOCUMENTED*` and say so in its own `_note`. This is enforced by
+`tests/test_hubtel_adapter.py::test_fixtures_are_honest`. The reason
+this matters: every status-check mock in this repo used to invent the
+same wrong, flat, capitalized shape, so nothing ever exercised the real
+one -- which is exactly how the response above parsed as `"unknown"` in
+production while every test stayed green.
 
 ## Service Fulfilment URL
 
@@ -253,8 +307,8 @@ needed for this stub (it never returns `Type: "AddToCart"`).
       -- whether it requires the phone number to belong to a Hubtel user
       who can't edit it, or whether we must confirm an unregistered
       number before charging it
-- [ ] The exact field names carrying the status-check's status word and
-      amount (`app/providers/hubtel_adapter.py` still guesses at these)
+- [x] The exact field names carrying the status-check's status word and
+      amount -- CONFIRMED 28 Nov 2026, real capture (see above)
 - [ ] The fulfilment request body's fields beyond `SessionId`/`OrderId`
 - [ ] The final callback body beyond the four fields already confirmed
 - [ ] Whether `clientReference` in the status check is really the USSD `SessionId`

@@ -10,10 +10,12 @@ POST) is mocked in every test in this file. None of them makes a real
 network call.
 """
 
+import json
 import logging
 import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import functools
@@ -44,6 +46,13 @@ TEST_DB_URI = f"mysql+pymysql://root:@127.0.0.1:3306/{TEST_DB_NAME}?charset=utf8
 # Naive (no tzinfo) on purpose -- matches how VotingSettings' dates come
 # back after a real database round-trip (see app/services/voting_settings.py).
 NOW = datetime(2026, 6, 1, 12, 0, 0)
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def _load_fixture(name):
+    with open(FIXTURES_DIR / name) as f:
+        return json.load(f)
 
 
 def _ensure_test_database_exists():
@@ -146,15 +155,28 @@ def _make_pending_transaction(nominee_id_, session_id, quantity=2):
 
 
 def _paid_status_json(amount_pesewas, gross_pesewas=None):
-    """A "Paid" status-check body. amount_pesewas is the NET amount
-    (AmountAfterCharges) -- the figure compared against
-    Transaction.amount_pesewas. gross_pesewas (Amount, including
-    Hubtel's own fee) defaults to the same value when not given."""
+    """A "Paid" status-check body, in the CONFIRMED real envelope shape
+    (see tests/fixtures/hubtel_status_paid_REAL.json and
+    app/providers/hubtel_adapter.py's parse_status_response docstring):
+    {"message", "responseCode": "0000", "data": {"status", "amount",
+    "charges", "amountAfterCharges"}} -- never the old flat, capitalized
+    shape no real Hubtel response has ever actually used.
+
+    amount_pesewas is the NET amount (amountAfterCharges) -- the figure
+    compared against Transaction.amount_pesewas. gross_pesewas (amount,
+    including Hubtel's own fee) defaults to the same value (zero
+    charges) when not given."""
     gross_pesewas = gross_pesewas if gross_pesewas is not None else amount_pesewas
+    charges_pesewas = gross_pesewas - amount_pesewas
     return {
-        "Status": "Paid",
-        "Amount": str(Decimal(gross_pesewas) / 100),
-        "AmountAfterCharges": str(Decimal(amount_pesewas) / 100),
+        "message": "Successful",
+        "responseCode": "0000",
+        "data": {
+            "status": "Paid",
+            "amount": str(Decimal(gross_pesewas) / 100),
+            "charges": str(Decimal(charges_pesewas) / 100),
+            "amountAfterCharges": str(Decimal(amount_pesewas) / 100),
+        },
     }
 
 
@@ -195,17 +217,23 @@ def test_valid_paid_amount_creates_vote_and_sends_callback_once(app, nominee_id)
 def test_real_captured_gross_vs_net_body_records_one_vote(app, nominee_id):
     """Regression test for the real-world bug: Hubtel's status-check
     response for a 100-pesewa vote fee came back as
-    Amount=1.01/Charges=0.01/AmountAfterCharges=1.00 -- the gross amount
+    amount=1.01/charges=0.01/amountAfterCharges=1.00 -- the gross amount
     (1.01) includes Hubtel's own fee, so comparing against it instead of
-    the net AmountAfterCharges (1.00) made a genuinely paid transaction
-    look like an amount mismatch and get stuck 'pending'."""
+    the net amountAfterCharges (1.00) made a genuinely paid transaction
+    look like an amount mismatch and get stuck 'pending'.
+
+    Uses the REAL captured body (tests/fixtures/hubtel_status_paid_REAL.json)
+    verbatim, not an invented one -- see test_hubtel_adapter.py for why
+    that distinction matters (a second real-world bug: every mock in
+    this file used to use a shape no real Hubtel response has ever
+    actually sent)."""
     with app.app_context():
         _open_voting(fee_pesewas=100)
         transaction = _make_pending_transaction(nominee_id, "sess-real-gross-net", quantity=1)
         transaction_id = transaction.id
         assert transaction.amount_pesewas == 100
 
-        real_body = {"Status": "Paid", "Amount": "1.01", "Charges": "0.01", "AmountAfterCharges": "1.0"}
+        real_body = _load_fixture("hubtel_status_paid_REAL.json")
 
         with patch("app.services.hubtel_fulfilment.check_transaction_status",
                    return_value=(200, real_body)), \
@@ -218,6 +246,48 @@ def test_real_captured_gross_vs_net_body_records_one_vote(app, nominee_id):
         assert t.last_status_outcome == "paid"
         assert t.last_status_note is None
         assert Vote.query.filter_by(transaction_id=transaction_id).count() == 1
+
+
+@pytest.mark.parametrize("fixture_name,expected_amount_pesewas,quantity,expected_order_id", [
+    ("hubtel_status_paid_REAL.json", 100, 1, "1cde0454d1bf408cbce2005bc2228111"),
+    ("hubtel_status_paid_REAL_quantity2.json", 200, 2, None),
+])
+def test_real_fixture_contract_records_exactly_one_vote_and_is_idempotent(
+    app, nominee_id, fixture_name, expected_amount_pesewas, quantity, expected_order_id,
+):
+    """End-to-end contract test for both REAL captured status-check
+    bodies: each must be confirmed 'paid' for exactly its own amount,
+    record exactly one vote, and a second run (Hubtel retrying, or the
+    sweep picking the same transaction up again) must create no second
+    vote -- see record_successful_payment's idempotency guarantee."""
+    with app.app_context():
+        _open_voting(fee_pesewas=expected_amount_pesewas // quantity)
+        transaction = _make_pending_transaction(
+            nominee_id, f"sess-contract-{fixture_name}", quantity=quantity,
+        )
+        transaction_id = transaction.id
+        assert transaction.amount_pesewas == expected_amount_pesewas
+
+        if expected_order_id is not None:
+            transaction.hubtel_order_id = expected_order_id
+            db.session.commit()
+
+        real_body = _load_fixture(fixture_name)
+
+        with patch("app.services.hubtel_fulfilment.check_transaction_status",
+                   return_value=(200, real_body)), \
+             patch("app.services.hubtel_fulfilment.requests.post", return_value=MagicMock(status_code=200)):
+            process_hubtel_payment(transaction_id)
+            # Second run: same real body, same transaction -- must be a
+            # pure no-op, not a second vote.
+            process_hubtel_payment(transaction_id)
+
+        t = Transaction.query.filter_by(id=transaction_id).first()
+        assert t.status == "success"
+        assert t.needs_review is False
+        votes = Vote.query.filter_by(transaction_id=transaction_id).all()
+        assert len(votes) == 1
+        assert votes[0].quantity == quantity
 
 
 def test_same_fulfilment_request_twice_creates_one_vote_and_one_callback(app, nominee_id):
@@ -273,7 +343,9 @@ def test_order_id_mismatch_creates_no_vote_sends_no_callback(app, nominee_id):
         transaction = _make_pending_transaction(nominee_id, "sess-order-mismatch")
         transaction_id = transaction.id
         paid_body = _paid_status_json(transaction.amount_pesewas)
-        paid_body["OrderId"] = "ORDER-WRONG"
+        # The real response reports this as data.transactionId, not a
+        # top-level "OrderId" -- see find_order_id_in_status_response.
+        paid_body["data"]["transactionId"] = "ORDER-WRONG"
 
         with patch("app.services.hubtel_fulfilment.check_transaction_status",
                    return_value=(200, paid_body)), \

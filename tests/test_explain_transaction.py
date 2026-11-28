@@ -5,7 +5,9 @@ network call. Uses an in-memory SQLite database (no row-locking needed
 here, unlike tests/test_hubtel_fulfilment.py).
 """
 
+import json
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -17,10 +19,18 @@ from app.models.nominee import Nominee
 from app.models.transaction import Transaction
 from app.models.vote import Vote
 from app.models.voting_settings import get_settings
+from app.services.hubtel_fulfilment import check_hubtel_status_for_transaction, process_hubtel_payment
 from app.services.transactions import create_pending_transaction
 from scripts.explain_transaction import run
 
 NOW = datetime(2026, 6, 1, 12, 0, 0)
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def _load_fixture(name):
+    with open(FIXTURES_DIR / name) as f:
+        return json.load(f)
 
 
 @pytest.fixture
@@ -78,7 +88,7 @@ def test_dry_run_makes_no_database_write(app, nominee_id, capsys):
         reference = transaction.reference
 
         with patch("app.services.hubtel_fulfilment.check_transaction_status",
-                   return_value=(200, {"Status": "Paid", "Amount": "1.01", "AmountAfterCharges": "1.00"})):
+                   return_value=(200, _load_fixture("hubtel_status_paid_REAL.json"))):
             ok = run(app, reference, apply_changes=False)
 
         assert ok is True
@@ -100,12 +110,14 @@ def test_apply_actually_processes_the_transaction(app, nominee_id, capsys):
         transaction = _make_pending_transaction(nominee_id, "sess-explain-apply")
         reference = transaction.reference
         # Needed for the real callback to go out -- send_final_callback
-        # never claims a transaction with no hubtel_order_id yet.
-        transaction.hubtel_order_id = "ORDER-1"
+        # never claims a transaction with no hubtel_order_id yet. Must
+        # match the real fixture's data.transactionId, or the order-id
+        # safety check in evaluate_payment_check blocks the vote.
+        transaction.hubtel_order_id = "1cde0454d1bf408cbce2005bc2228111"
         db.session.commit()
 
         with patch("app.services.hubtel_fulfilment.check_transaction_status",
-                   return_value=(200, {"Status": "Paid", "Amount": "1.01", "AmountAfterCharges": "1.00"})), \
+                   return_value=(200, _load_fixture("hubtel_status_paid_REAL.json"))), \
              patch("app.services.hubtel_fulfilment.requests.post", return_value=MagicMock(status_code=200)) as mock_post:
             ok = run(app, reference, apply_changes=True)
             assert mock_post.called
@@ -144,3 +156,54 @@ def test_unknown_reference_reports_not_found(app, capsys):
 
     assert ok is False
     assert "No transaction found" in capsys.readouterr().out
+
+
+def test_explain_transaction_and_the_sweep_parse_the_same_response_the_same_way(app, nominee_id, capsys):
+    """scripts/explain_transaction.py and the sweep (via
+    process_hubtel_payment) must never be able to silently disagree
+    about what a given Hubtel response means -- they both go through
+    check_hubtel_status_for_transaction (app/services/hubtel_fulfilment.py),
+    which calls the real check_transaction_status then the real
+    parse_status_response, every time. This proves it end-to-end: both
+    are fed the exact same (dict) raw_json -- what check_transaction_status
+    actually returns, never a pre-parsed string or a different shape --
+    and land on the same outcome for the same real fixture."""
+    real_body = _load_fixture("hubtel_status_paid_REAL.json")
+
+    with app.app_context():
+        _open_voting()
+        explained = _make_pending_transaction(nominee_id, "sess-explain-shared-parse")
+        explained.hubtel_order_id = "1cde0454d1bf408cbce2005bc2228111"
+        db.session.commit()
+        explained_reference = explained.reference
+
+        with patch("app.services.hubtel_fulfilment.check_transaction_status",
+                   return_value=(200, real_body)):
+            status, amount_pesewas, provider_total_pesewas, raw_json, error = (
+                check_hubtel_status_for_transaction(explained)
+            )
+        assert error is None
+        assert isinstance(raw_json, dict)  # exactly what check_transaction_status returns -- never a string
+
+        with patch("app.services.hubtel_fulfilment.check_transaction_status",
+                   return_value=(200, real_body)):
+            ok = run(app, explained_reference, apply_changes=False)
+        assert ok is True
+
+        swept = _make_pending_transaction(nominee_id, "sess-swept-shared-parse")
+        swept.hubtel_order_id = "1cde0454d1bf408cbce2005bc2228111"
+        db.session.commit()
+        swept_id = swept.id
+
+        with patch("app.services.hubtel_fulfilment.check_transaction_status",
+                   return_value=(200, real_body)), \
+             patch("app.services.hubtel_fulfilment.requests.post", return_value=MagicMock(status_code=200)):
+            process_hubtel_payment(swept_id)
+
+        swept = Transaction.query.filter_by(id=swept_id).first()
+
+    output = capsys.readouterr().out
+    assert f"status:                 {status}" in output
+    assert status == "paid" == swept.last_status_outcome
+    assert amount_pesewas == 100
+    assert Vote.query.filter_by(transaction_id=swept.id).count() == 1

@@ -1,0 +1,17 @@
+{
+  "message": "Successful",
+  "responseCode": "0000",
+  "data": {
+    "date": "2026-11-28T08:06:11.3714712+00:00",
+    "status": "Paid",
+    "transactionId": "1cde0454d1bf408cbce2005bc2228111",
+    "externalTransactionId": "********102",
+    "paymentMethod": "mobilemoney",
+    "clientReference": "e38835ef7748448fafe89f2e22da5cf7",
+    "currencyCode": null,
+    "amount": 1.01,
+    "charges": 0.01,
+    "amountAfterCharges": 1.0,
+    "isFulfilled": null
+  }
+}

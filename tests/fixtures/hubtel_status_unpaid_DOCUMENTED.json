@@ -1,0 +1,11 @@
+{
+  "_note": "DOCUMENTED SAMPLE -- not a real capture. Hubtel's docs (see docs/HUBTEL_USSD_NOTES.md) confirm the status word 'Unpaid' exists, but we don't have a real captured status-check response for an unpaid transaction. Built using the same envelope/field-name shape as the confirmed real 'Paid' capture (tests/fixtures/hubtel_status_paid_REAL.json) -- update this file if a real unpaid capture is ever obtained.",
+  "message": "Successful",
+  "responseCode": "0000",
+  "data": {
+    "status": "Unpaid",
+    "amount": null,
+    "charges": null,
+    "amountAfterCharges": null
+  }
+}

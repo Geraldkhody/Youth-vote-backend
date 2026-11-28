@@ -1,0 +1,11 @@
+{
+  "_note": "REAL captured money fields and envelope shape (message/responseCode/data, status/amount/charges/amountAfterCharges) from a second real payment, for a 2-vote purchase (quantity 2, amount_pesewas 200): amount 2.1, charges 0.1, amountAfterCharges 2.0. transactionId/externalTransactionId/clientReference are deliberately left out -- their real captured values were not provided, and inventing fake-looking ones does not belong in a *_REAL fixture (see docs/HUBTEL_USSD_NOTES.md). The contract test for this fixture does not rely on an order-id match.",
+  "message": "Successful",
+  "responseCode": "0000",
+  "data": {
+    "status": "Paid",
+    "amount": 2.1,
+    "charges": 0.1,
+    "amountAfterCharges": 2.0
+  }
+}
